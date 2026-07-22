@@ -1,0 +1,39 @@
+name: Estonia D-Visa Slot Monitor
+
+on:
+  schedule:
+    # Runs every 15 minutes. GitHub's scheduler is best-effort and can lag
+    # a few minutes under load, but this is as tight as free cron gets.
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
+
+jobs:
+  check-slot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Persists .state/monitor_state.json across runs so a prolonged outage
+      # only sends one failure alert per cooldown window instead of spamming
+      # Telegram every 15 minutes. Safe to delete this step; the script just
+      # won't remember previous failures without it.
+      - name: Restore failure-alert state
+        uses: actions/cache@v4
+        with:
+          path: .state
+          key: visa-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            visa-monitor-state-
+
+      - name: Check visa slot availability
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python estonia_visa_monitor.py
