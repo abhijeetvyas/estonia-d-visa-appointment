@@ -87,21 +87,39 @@ def check_availability():
 
 def _telegram_creds():
     token = os.environ.get('TELEGRAM_BOT_TOKEN') or os.environ.get('VISA_BOT')
-    chat_id = os.environ.get('TELEGRAM_CHAT_ID') or os.environ.get('VISA_BOT_CHAT_ID')
-    if not token or not chat_id:
+    chat_id_raw = os.environ.get('TELEGRAM_CHAT_ID') or os.environ.get('VISA_BOT_CHAT_ID')
+    if not token or not chat_id_raw:
         raise RuntimeError('TELEGRAM_BOT_TOKEN/VISA_BOT or TELEGRAM_CHAT_ID/VISA_BOT_CHAT_ID not set')
-    return token, chat_id
+    # Supports multiple recipients: TELEGRAM_CHAT_ID="111111,222222"
+    chat_ids = [c.strip() for c in chat_id_raw.split(',') if c.strip()]
+    if not chat_ids:
+        raise RuntimeError('TELEGRAM_CHAT_ID/VISA_BOT_CHAT_ID is set but empty after parsing')
+    return token, chat_ids
 
 
 def send_telegram_text(message):
-    token, chat_id = _telegram_creds()
-    resp = requests.post(
-        f'https://api.telegram.org/bot{token}/sendMessage',
-        data={'chat_id': chat_id, 'text': message},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    token, chat_ids = _telegram_creds()
+    errors = []
+    sent_count = 0
+    for chat_id in chat_ids:
+        try:
+            resp = requests.post(
+                f'https://api.telegram.org/bot{token}/sendMessage',
+                data={'chat_id': chat_id, 'text': message},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            sent_count += 1
+        except Exception as e:
+            errors.append(f'{chat_id}: {e}')
+
+    if sent_count == 0:
+        # Every recipient failed — this should count as a real send failure.
+        raise RuntimeError(f'Failed to send to all Telegram recipients: {"; ".join(errors)}')
+    if errors:
+        # Partial failure: at least one recipient got it, so don't crash the
+        # whole run over it, but make sure it's visible in the logs.
+        print(f'Telegram send partially failed for some recipients: {"; ".join(errors)}', file=sys.stderr)
 
 
 RUNTIME_SIGNATURE = '\n\n— Sent from GCP'
