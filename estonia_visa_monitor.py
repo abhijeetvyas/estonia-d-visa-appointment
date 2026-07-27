@@ -10,10 +10,21 @@ from bs4 import BeautifulSoup
 URL = 'https://broneering.mfa.ee/en/'
 TARGET = 'Long-stay visa (D-visa) application'
 
+# Which embassy to check. Defaults preserve the original New Delhi behavior;
+# pass EMBASSY_ID/EMBASSY_NAME env vars (wired from workflow_dispatch inputs
+# in the workflow file) to reuse this same repo/script for another embassy
+# instead of forking or branching.
+EMBASSY_ID = os.environ.get('EMBASSY_ID', '40')
+EMBASSY_NAME = os.environ.get('EMBASSY_NAME', 'New Delhi')
+
 # Where GitHub Actions cache restores/saves failure-alert state between runs.
+# Namespaced per embassy so two embassies checked from the same repo don't
+# share (and incorrectly suppress) each other's failure-alert cooldown.
 # See .github/workflows/estonia-visa-monitor.yml — this path is cached so
 # repeated failures don't spam Telegram every 15 minutes.
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.state', 'monitor_state.json')
+STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '.state', f'monitor_state_{EMBASSY_ID}.json'
+)
 FAILURE_ALERT_COOLDOWN_SECONDS = int(1.5 * 60 * 60)  # re-alert on an ongoing failure at most every 1.5h
 
 
@@ -46,7 +57,7 @@ def check_availability():
         'Origin': 'https://broneering.mfa.ee',
     }
     data = {
-        'broneering[esindus]': '40',
+        'broneering[esindus]': EMBASSY_ID,
         'broneering[isikuteArv]': '1',
         'broneering[_token]': token,
         'turbo': '',
@@ -93,7 +104,7 @@ def send_telegram_text(message):
     return resp.json()
 
 
-GITHUB_SIGNATURE = '\n\n— Sent from GitHub Actions'
+RUNTIME_SIGNATURE = '\n\n— Sent from GCP'
 
 
 def _cooldown_hours_display():
@@ -105,24 +116,24 @@ def send_availability_alert(available):
     services_text = '\n'.join(f'- {s}' for s in available) if available else '- (none listed)'
     message = (
         f'✅ Long-stay visa (D-visa) application is now available for '
-        f'Embassy of the Republic of Estonia in New Delhi.\n\n'
+        f'Embassy of the Republic of Estonia in {EMBASSY_NAME}.\n\n'
         f'Available services:\n{services_text}\n\n'
         f'Book here: {URL}'
-        f'{GITHUB_SIGNATURE}'
+        f'{RUNTIME_SIGNATURE}'
     )
     send_telegram_text(message)
 
 
 def send_failure_alert(error_summary):
     message = (
-        f'⚠️ Estonia visa monitor is FAILING and cannot currently check the '
+        f'⚠️ Estonia visa monitor ({EMBASSY_NAME}) is FAILING and cannot currently check the '
         f'booking calendar.\n\n'
         f'Error: {error_summary}\n\n'
         f'This means slot checks are not happening reliably until this is '
-        f'fixed. Check the GitHub Actions run logs for the full traceback.\n'
+        f'fixed. Check monitor.log on the VM for the full traceback.\n'
         f'(You will not be re-alerted for the same ongoing issue for '
         f'{_cooldown_hours_display()}.)'
-        f'{GITHUB_SIGNATURE}'
+        f'{RUNTIME_SIGNATURE}'
     )
     send_telegram_text(message)
 
@@ -178,7 +189,26 @@ def clear_failure_state_if_needed():
         save_state(state)
 
 
+def send_test_alert():
+    """Dummy run that only exercises the Telegram send path — does not touch
+    the booking site at all. Used to verify TELEGRAM_BOT_TOKEN/CHAT_ID are
+    wired correctly in GitHub Actions before relying on the real monitor."""
+    message = (
+        f'🧪 Test message from the Estonia D-visa slot monitor.\n\n'
+        f'If you can read this, GitHub Actions can successfully send '
+        f'Telegram messages using your configured secrets. No real '
+        f'availability check was performed.'
+        f'{RUNTIME_SIGNATURE}'
+    )
+    send_telegram_text(message)
+    print('Test message sent to Telegram successfully.')
+
+
 def main():
+    if os.environ.get('TEST_TELEGRAM', '').lower() in ('1', 'true', 'yes'):
+        send_test_alert()
+        return
+
     try:
         # One retry for transient network/session blips before treating this
         # as a real failure worth alerting on.
