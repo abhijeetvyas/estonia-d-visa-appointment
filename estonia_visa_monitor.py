@@ -125,6 +125,47 @@ def send_telegram_text(message):
 RUNTIME_SIGNATURE = '\n\n— Sent from GCP'
 
 
+def trigger_phone_calls():
+    """Places a Twilio voice call to each configured recipient. Used only for
+    real availability alerts and test runs — never for failure alerts, by
+    design (failures are frequent/expected during outages and shouldn't ring
+    anyone's phone repeatedly)."""
+    account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
+    auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
+    from_number = os.environ.get('TWILIO_FROM_NUMBER')
+    to_numbers_raw = os.environ.get('TWILIO_TO_NUMBERS')
+    twiml_url = os.environ.get('TWILIO_TWIML_URL')
+
+    if not all([account_sid, auth_token, from_number, to_numbers_raw, twiml_url]):
+        print(
+            'Twilio call skipped: one or more of TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/'
+            'TWILIO_FROM_NUMBER/TWILIO_TO_NUMBERS/TWILIO_TWIML_URL not set.',
+            file=sys.stderr,
+        )
+        return
+
+    to_numbers = [n.strip() for n in to_numbers_raw.split(',') if n.strip()]
+    errors = []
+    for to_number in to_numbers:
+        try:
+            resp = requests.post(
+                f'https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls.json',
+                auth=(account_sid, auth_token),
+                data={'To': to_number, 'From': from_number, 'Url': twiml_url},
+                timeout=30,
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            errors.append(f'{to_number}: {e}')
+
+    if errors:
+        # Don't let a failed call crash the run — Telegram already went out
+        # (or is about to) as the primary channel; the call is a bonus.
+        print(f'Twilio call failed for some recipients: {"; ".join(errors)}', file=sys.stderr)
+    else:
+        print(f'Twilio calls placed to: {", ".join(to_numbers)}')
+
+
 def _cooldown_hours_display():
     hours = FAILURE_ALERT_COOLDOWN_SECONDS / 3600
     return f'{hours:g}h'
@@ -140,6 +181,7 @@ def send_availability_alert(available):
         f'{RUNTIME_SIGNATURE}'
     )
     send_telegram_text(message)
+    trigger_phone_calls()
 
 
 def send_failure_alert(error_summary):
@@ -220,6 +262,7 @@ def send_test_alert():
     )
     send_telegram_text(message)
     print('Test message sent to Telegram successfully.')
+    trigger_phone_calls()
 
 
 def main():
