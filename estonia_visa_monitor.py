@@ -3,12 +3,35 @@ import os
 import sys
 import time
 import traceback
+from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
 URL = 'https://broneering.mfa.ee/en/'
 TARGET = 'Long-stay visa (D-visa) application'
+
+
+def log_line(msg, file=sys.stdout):
+    """Prints with an ISO timestamp prefix so log entries can be correlated
+    with actual wall-clock time (monitor.log had no timestamps before this,
+    making it impossible to tell when any given run happened)."""
+    ts = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    print(f'{ts} {msg}', file=file)
+
+
+# Separate, append-only file that ONLY ever records AVAILABLE/FAILURE events
+# (never the routine "not available" noise). This file should never be
+# manually truncated (unlike monitor.log, which is fine to clear/rotate) —
+# it exists specifically so a real slot-found or failure event can't be lost
+# to a `> monitor.log` reset during future debugging.
+ALERTS_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'alerts_history.log')
+
+
+def record_alert(msg):
+    ts = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    with open(ALERTS_LOG_FILE, 'a') as f:
+        f.write(f'{ts} {msg}\n')
 
 # Which embassy to check. Defaults preserve the original New Delhi behavior;
 # pass EMBASSY_ID/EMBASSY_NAME env vars (wired from workflow_dispatch inputs
@@ -182,6 +205,7 @@ def send_availability_alert(available):
     )
     send_telegram_text(message)
     trigger_phone_calls()
+    record_alert(f'AVAILABLE: {available}')
 
 
 def send_failure_alert(error_summary):
@@ -217,8 +241,9 @@ def handle_failure(exc):
     doesn't spam Telegram every 15 minutes. Never raises further — a failure
     in the alerting path must not mask the original error's exit code."""
     error_summary = f'{type(exc).__name__}: {exc}'
-    print(f'MONITOR FAILURE: {error_summary}', file=sys.stderr)
+    log_line(f'MONITOR FAILURE: {error_summary}', file=sys.stderr)
     traceback.print_exc()
+    record_alert(f'FAILURE: {error_summary}')
 
     state = load_state()
     last_alert = state.get('last_failure_alert_ts', 0)
@@ -227,16 +252,16 @@ def handle_failure(exc):
     if now - last_alert >= FAILURE_ALERT_COOLDOWN_SECONDS:
         try:
             send_failure_alert(error_summary)
-            print('Failure alert sent to Telegram.', file=sys.stderr)
+            log_line('Failure alert sent to Telegram.', file=sys.stderr)
             state['last_failure_alert_ts'] = now
             save_state(state)
         except Exception as alert_exc:
             # If Telegram itself is unreachable/misconfigured, we can't alert —
             # rely on the GitHub Actions run showing as failed/red instead.
-            print(f'Could not send failure alert to Telegram: {alert_exc}', file=sys.stderr)
+            log_line(f'Could not send failure alert to Telegram: {alert_exc}', file=sys.stderr)
     else:
         remaining = int(FAILURE_ALERT_COOLDOWN_SECONDS - (now - last_alert))
-        print(f'Suppressing duplicate failure alert (cooldown active, {remaining}s remaining).', file=sys.stderr)
+        log_line(f'Suppressing duplicate failure alert (cooldown active, {remaining}s remaining).', file=sys.stderr)
 
 
 def clear_failure_state_if_needed():
@@ -261,7 +286,7 @@ def send_test_alert():
         f'{RUNTIME_SIGNATURE}'
     )
     send_telegram_text(message)
-    print('Test message sent to Telegram successfully.')
+    log_line('Test message sent to Telegram successfully.')
     trigger_phone_calls()
 
 
@@ -276,7 +301,7 @@ def main():
         try:
             found, available = check_availability()
         except Exception as e:
-            print(f'First attempt failed ({e}), retrying once...', file=sys.stderr)
+            log_line(f'First attempt failed ({e}), retrying once...', file=sys.stderr)
             found, available = check_availability()
     except Exception as exc:
         handle_failure(exc)
@@ -286,9 +311,9 @@ def main():
 
     if found:
         send_availability_alert(available)
-        print(f'AVAILABLE: {TARGET}. Telegram sent. Services: {available}')
+        log_line(f'AVAILABLE: {TARGET}. Telegram sent. Services: {available}')
     else:
-        print(f'NOT available. Services: {available}')
+        log_line(f'NOT available. Services: {available}')
 
 
 if __name__ == '__main__':
