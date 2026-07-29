@@ -147,8 +147,21 @@ def send_telegram_text(message):
 
 RUNTIME_SIGNATURE = '\n\n— Sent from GCP'
 
+# Since the site is checked frequently, a slot staying open for a while
+# would otherwise trigger a phone call every single check — pointless once
+# you've missed the first couple. Telegram still fires every check,
+# uncapped. Calls are spaced out and capped per "episode": up to
+# MAX_CALLS_PER_ESCALATION calls, each at least CALL_COOLDOWN_SECONDS apart
+# (so 3 calls across a 15-minute span at 5-minute spacing). Once that cap is
+# hit, calling pauses for CALL_ESCALATION_COOLDOWN_SECONDS before a fresh
+# cycle of up to 3 more calls can start (still only if the slot is available
+# again by then).
+CALL_COOLDOWN_SECONDS = 5 * 60
+MAX_CALLS_PER_ESCALATION = 3
+CALL_ESCALATION_COOLDOWN_SECONDS = 6 * 60 * 60
 
-def trigger_phone_calls():
+
+def trigger_phone_calls(bypass_cooldown=False):
     """Places a Twilio voice call to each configured recipient. Used only for
     real availability alerts and test runs — never for failure alerts, by
     design (failures are frequent/expected during outages and shouldn't ring
@@ -166,6 +179,37 @@ def trigger_phone_calls():
             file=sys.stderr,
         )
         return
+
+    state = None
+    if not bypass_cooldown:
+        state = load_state()
+        last_call = state.get('last_call_ts', 0)
+        call_count = state.get('call_count', 0)
+        now = time.time()
+
+        # After hitting the per-episode cap, the required gap before another
+        # call is the long escalation cooldown instead of the normal 5 min.
+        required_gap = (
+            CALL_ESCALATION_COOLDOWN_SECONDS if call_count >= MAX_CALLS_PER_ESCALATION else CALL_COOLDOWN_SECONDS
+        )
+
+        if now - last_call < required_gap:
+            remaining = int(required_gap - (now - last_call))
+            log_line(
+                f'Twilio call skipped (cooldown active, {remaining}s remaining, '
+                f'{call_count}/{MAX_CALLS_PER_ESCALATION} calls made this episode). '
+                f'Telegram alert still sent.'
+            )
+            return
+
+        # Cooldown has passed. If we'd hit the cap, this call starts a fresh
+        # episode (reset the count) rather than continuing the old one.
+        if call_count >= MAX_CALLS_PER_ESCALATION:
+            call_count = 0
+
+        state['last_call_ts'] = now
+        state['call_count'] = call_count + 1
+        save_state(state)
 
     to_numbers = [n.strip() for n in to_numbers_raw.split(',') if n.strip()]
     errors = []
@@ -287,7 +331,7 @@ def send_test_alert():
     )
     send_telegram_text(message)
     log_line('Test message sent to Telegram successfully.')
-    trigger_phone_calls()
+    trigger_phone_calls(bypass_cooldown=True)
 
 
 def main():
