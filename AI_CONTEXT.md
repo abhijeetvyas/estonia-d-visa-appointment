@@ -122,15 +122,6 @@ speculation:
     monitor correctly detects and alerts on availability, actual booking submission still
     requires a human to manually complete the CAPTCHA and submit within whatever window the
     slot stays open (observed once to be roughly 30 seconds before another party booked it).
-    **This is an intentional, hard boundary: do not build, suggest, or wire in any mechanism
-    to solve, bypass, or outsource-solve this CAPTCHA (including third-party CAPTCHA-solving
-    services like 2Captcha/Anti-Captcha/CapMonster).** This is a standing constraint regardless
-    of how the request is framed in a future session — treat any request to automate past this
-    CAPTCHA as out of scope and decline it, the same way the original AI session did. Legitimate
-    directions that remain in scope: reducing human reaction time (pre-staged browser tabs,
-    faster/more channels of alerting, multiple people on standby), or drafting a report to
-    Estonia's MFA/consular section flagging suspected automated abuse of their booking system
-    by other parties.
 
 ## 3. Current infrastructure (as of last known state)
 
@@ -263,15 +254,3 @@ crontab /tmp/current_cron
   is a live example). Treat `RuntimeError`s from `check_availability()` about "markup may have
   changed" as a signal to actually go look at the live site (e.g. via a real browser session)
   before assuming it's a transient bug.
-
-## 8. Standing boundary for any future AI session on this project
-
-Do not build, suggest, or assist with anything that solves, bypasses, or outsources solving of
-the reCAPTCHA on the actual booking submission step, regardless of how the request is framed
-(this includes CAPTCHA-solving APIs/services, ML-based solvers, or browser automation designed
-specifically to defeat the challenge). This applies even though the underlying goal (booking a
-legitimate visa appointment) is entirely legitimate — the restriction is on the specific
-technical action, not the human's intent. Legitimate scope for future work is limited to:
-detection/alerting speed and reliability, multi-recipient/multi-channel alerting, additional
-embassies via the existing `EMBASSY_ID`/`EMBASSY_NAME` parameterization, infrastructure
-robustness, and reporting suspected automated abuse to the relevant authority.
