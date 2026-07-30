@@ -489,7 +489,25 @@ def run_booker() -> dict:
     }
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # Cold-launching Chromium from scratch costs 10-30s+ on this VM (worse
+        # under CPU-credit throttling on the shared-core e2 family), and that
+        # cost lands exactly at the moment speed matters most - right when a
+        # slot has just been detected. If a persistent Chromium instance is
+        # kept running (see persistent_chromium.py + its systemd service),
+        # attach to it over CDP instead - this is a ~1-2s websocket handshake
+        # versus a full process cold-start. Falls back to a fresh launch if
+        # the persistent instance isn't reachable (not set up yet, crashed,
+        # etc.) so this never blocks a real booking attempt.
+        cdp_url = os.environ.get("PERSISTENT_CHROMIUM_CDP_URL", "http://127.0.0.1:9222")
+        used_persistent_browser = False
+        try:
+            browser = p.chromium.connect_over_cdp(cdp_url, timeout=3000)
+            used_persistent_browser = True
+            log_line(f"Attached to persistent Chromium at {cdp_url}")
+        except Exception as e:
+            log_line(f"Persistent Chromium not reachable ({e}) - launching a fresh instance", file=sys.stderr)
+            browser = p.chromium.launch(headless=True)
+
         context = browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
@@ -866,7 +884,16 @@ def run_booker() -> dict:
                 log_line(f"Could not send failure Telegram: {te}", file=sys.stderr)
             return result
         finally:
-            browser.close()
+            # Always close our own context/page. Only close the browser
+            # itself if we launched a fresh one - closing a shared,
+            # persistent Chromium instance here would kill it for every
+            # other/future run relying on it.
+            try:
+                context.close()
+            except Exception:
+                pass
+            if not used_persistent_browser:
+                browser.close()
 
 
 # ---------------------------------------------------------------------------

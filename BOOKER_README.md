@@ -97,6 +97,56 @@ Edit `run_monitor.sh` so the final Python line becomes:
 
 (The original `estonia_visa_monitor.py` remains available if you ever want to disable the booker by simply unsetting `ENABLE_BOOKER`.)
 
+### Optional: keep Chromium warm to cut booking latency
+
+Cold-launching Chromium from scratch (`p.chromium.launch()`) was observed
+taking 10-30s+ on this VM, and considerably longer under CPU-credit
+throttling from back-to-back runs (shared-core `e2` family instances all use
+a baseline+burst credit model). That cost lands exactly at the moment speed
+matters most - right after a slot is detected. `persistent_chromium.py`
+keeps one headless Chromium instance running permanently with a local CDP
+port open; the booker attaches to it via Playwright's `connect_over_cdp()`
+(a ~1-2s handshake) instead of paying the full cold-start cost. It falls
+back to a fresh launch automatically if the persistent instance isn't
+reachable, so setting this up is optional - the booker works either way.
+
+Set up as a systemd service so it survives reboots and auto-restarts if
+Chromium crashes:
+
+```bash
+sudo tee /etc/systemd/system/estonia-chromium.service > /dev/null << 'EOF'
+[Unit]
+Description=Persistent headless Chromium for Estonia visa booker
+After=network.target
+
+[Service]
+Type=simple
+User=abhijeetvyas13
+WorkingDirectory=/home/abhijeetvyas13/estonia-d-visa-appointment
+ExecStart=/home/abhijeetvyas13/estonia-d-visa-appointment/venv/bin/python3 persistent_chromium.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now estonia-chromium
+sudo systemctl status estonia-chromium   # confirm it's running
+```
+
+No env var changes needed in `run_monitor.sh` — the booker checks
+`http://127.0.0.1:9222` by default. Override with `PERSISTENT_CHROMIUM_CDP_URL`
+if you ever change the port (also update `PERSISTENT_CHROMIUM_CDP_PORT` for
+`persistent_chromium.py` itself to match).
+
+To confirm it's actually being used, look for this line in a run's log:
+`Attached to persistent Chromium at http://127.0.0.1:9222` — if you instead
+see `Persistent Chromium not reachable ... launching a fresh instance`, the
+service isn't up (check `sudo systemctl status estonia-chromium` and
+`sudo journalctl -u estonia-chromium -n 50`).
+
 ### Dry-run test on the VM
 
 ```bash
