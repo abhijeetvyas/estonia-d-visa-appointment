@@ -546,43 +546,62 @@ def run_booker() -> dict:
                 return result
             log_line(f"Chosen date: {selected_date}")
 
-            # Click the day in flatpickr, ensuring it triggers even if previously selected
-            day_sel = f'.flatpickr-day[aria-label="{selected_date}"]'
-            if page.locator(day_sel).count() > 0:
-                page.evaluate(
-                    f"""() => {{
-                        const day = document.querySelector('.flatpickr-day[aria-label="{selected_date}"]');
-                        if (day) {{
-                            day.classList.add('selected');
-                            day.click();
-                        }}
-                    }}"""
-                )
-            else:
-                page.evaluate(
-                    f"""() => {{
+            # Select the day.
+            #
+            # Two things were wrong with the old approach:
+            # 1. It matched flatpickr's `aria-label` against our ISO date string
+            #    ("2026-08-18") - but flatpickr renders aria-label as a
+            #    locale-formatted string ("August 18, 2026"). That match always
+            #    failed silently, so the day click never fired.
+            # 2. Even fixing the click, the old code *also* manually set the
+            #    hidden `broneering[kuupaev]` input to the raw ISO string and
+            #    dispatched generic `change`/`input` events on it. The Stimulus
+            #    controller backing this form expects the date in `DD.MM.YYYY`
+            #    format and drives off flatpickr's own `onChange` - feeding it a
+            #    malformed value via a manual DOM event is what was causing
+            #    Turbo to reset/reload the form, wiping out whatever time slots
+            #    the (now-working) day click had just loaded.
+            #
+            # Fix: drive flatpickr's own `setDate()` API on the input's
+            # `_flatpickr` instance. It formats the date correctly, updates the
+            # calendar UI, and fires flatpickr's real internal onChange -
+            # which is what the Stimulus controller is actually listening for.
+            # Fall back to clicking the day-of-month cell directly (locale
+            # independent, unlike aria-label) if the flatpickr instance isn't
+            # reachable for any reason.
+            used_flatpickr_api = page.evaluate(
+                """(dateStr) => {
+                    const input = document.querySelector('input[name="broneering[kuupaev]"]');
+                    if (input && input._flatpickr) {
+                        input._flatpickr.setDate(dateStr, true);
+                        return true;
+                    }
+                    return false;
+                }""",
+                selected_date,
+            )
+            if not used_flatpickr_api:
+                log_line("flatpickr instance not found on date input - falling back to manual day click", file=sys.stderr)
+                day_num = datetime.strptime(selected_date, "%Y-%m-%d").day
+                clicked = page.evaluate(
+                    """(dayNum) => {
                         const days = document.querySelectorAll('.flatpickr-day');
-                        for (const day of days) {{
-                            if (day.getAttribute('aria-label') === '{selected_date}') {{
-                                day.click(); break;
-                            }}
-                        }}
-                    }}"""
+                        for (const day of days) {
+                            if (day.classList.contains('prevMonthDay') || day.classList.contains('nextMonthDay')) continue;
+                            if (day.classList.contains('flatpickr-disabled')) continue;
+                            if (parseInt(day.textContent.trim(), 10) === dayNum) {
+                                day.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""",
+                    day_num,
                 )
+                if not clicked:
+                    log_line(f"WARNING: could not find a clickable flatpickr day for {selected_date}", file=sys.stderr)
             time.sleep(1)
 
-            # Also set the hidden date input (required by Stimulus)
-            page.evaluate(
-                f"""() => {{
-                    const input = document.querySelector('input[name="broneering[kuupaev]"]');
-                    if (input) {{
-                        input.value = '{selected_date}';
-                        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    }}
-                }}"""
-            )
-            
             # Wait for time slots to load asynchronously after date selection
             try:
                 page.wait_for_selector('input[type="checkbox"][name="broneering[vastuvotud][]"]', timeout=10000)
@@ -593,40 +612,44 @@ def run_booker() -> dict:
             screenshot(page, "09_date_selected")
 
             # ----- Collect time slots for the chosen date -----
-            time_checkboxes = page.locator('input[type="checkbox"][name="broneering[vastuvotud][]"]')
-            # Also try to read visible labels
-            time_labels = page.evaluate(
+            # The site's checkbox `value` attribute is an internal slot ID
+            # (e.g. "2249050"), NOT the displayed time - the real HH:MM text
+            # lives in a separate <label for="checkbox-id">HH:MM</label>
+            # element. Pair each checkbox with its label via the for/id
+            # relationship (the only reliable link - not DOM proximity, and
+            # not a page-wide scan of every label/span/div, which is both
+            # fragile and can pick up unrelated HH:MM-shaped text elsewhere
+            # on the page) so we can select the exact checkbox by its real
+            # slot ID afterward instead of fuzzy string matching.
+            slots = page.evaluate(
                 """() => {
-                    const labels = [];
+                    const out = [];
                     document.querySelectorAll('input[name="broneering[vastuvotud][]"]').forEach(cb => {
-                        const lab = cb.parentElement ? cb.parentElement.textContent.trim() : '';
-                        // often the label is a sibling or the value itself
-                        const val = cb.value || lab;
-                        if (val) labels.push(val);
+                        const lab = cb.id ? document.querySelector(`label[for="${cb.id}"]`) : null;
+                        const time = lab ? lab.textContent.trim() : '';
+                        out.push({ value: cb.value, time });
                     });
-                    // also grab any visible time text near checkboxes
-                    document.querySelectorAll('label, span, div').forEach(el => {
-                        const t = el.textContent.trim();
-                        if (/^\\d{1,2}:\\d{2}$/.test(t)) labels.push(t);
-                    });
-                    return [...new Set(labels)];
+                    return out;
                 }"""
             )
-            # Prefer clean HH:MM strings
-            clean_times = [t for t in time_labels if re.match(r"^\d{1,2}:\d{2}$", t)]
-            if not clean_times:
-                # fallback: read the value attributes of the checkboxes
-                clean_times = page.evaluate(
-                    """() => Array.from(document.querySelectorAll(
-                        'input[name="broneering[vastuvotud][]"]')).map(c => c.value).filter(Boolean)"""
-                )
+            clean_times = [s["time"] for s in slots if re.match(r"^\d{1,2}:\d{2}$", s.get("time", ""))]
             log_line(f"Time slots for {selected_date}: {clean_times}")
 
             selected_time = choose_time(clean_times)
             if not selected_time:
-                # last resort: just check the first checkbox
-                if time_checkboxes.count() > 0:
-                    time_checkboxes.first.check()
+                # last resort: just check the first checkbox, whatever it is
+                if slots:
+                    first_value = slots[0]["value"]
+                    page.evaluate(
+                        """(value) => {
+                            const cb = document.querySelector(`input[name="broneering[vastuvotud][]"][value="${value}"]`);
+                            if (cb) {
+                                cb.checked = true;
+                                cb.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                        }""",
+                        first_value,
+                    )
                     selected_time = "(first available)"
                     log_line("No parseable times – checked first checkbox")
                 else:
@@ -634,28 +657,25 @@ def run_booker() -> dict:
                     result["message"] = f"No time slots found for {selected_date}"
                     return result
             else:
-                # check the matching checkbox
-                checked = page.evaluate(
-                    f"""(wanted) => {{
-                        const boxes = document.querySelectorAll('input[name="broneering[vastuvotud][]"]');
-                        for (const cb of boxes) {{
-                            const lab = (cb.parentElement && cb.parentElement.textContent) || '';
-                            if (cb.value === wanted || lab.includes(wanted)) {{
+                # Select the checkbox whose label matched selected_time, by its
+                # real value (slot ID) - no fuzzy text matching needed since we
+                # already have the exact pairing from the evaluate() above.
+                match = next((s for s in slots if s.get("time") == selected_time), None)
+                if match:
+                    checked = page.evaluate(
+                        """(value) => {
+                            const cb = document.querySelector(`input[name="broneering[vastuvotud][]"][value="${value}"]`);
+                            if (cb) {
                                 cb.checked = true;
-                                cb.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                cb.dispatchEvent(new Event('change', { bubbles: true }));
                                 return true;
-                            }}
-                        }}
-                        // fallback first box
-                        if (boxes.length) {{
-                            boxes[0].checked = true;
-                            boxes[0].dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            return 'first';
-                        }}
-                        return false;
-                    }}""",
-                    selected_time,
-                )
+                            }
+                            return false;
+                        }""",
+                        match["value"],
+                    )
+                else:
+                    checked = False
                 log_line(f"Time selection result: {checked} (wanted {selected_time})")
             screenshot(page, "10_time_selected")
 
