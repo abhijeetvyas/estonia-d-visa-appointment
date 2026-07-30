@@ -546,12 +546,19 @@ def run_booker() -> dict:
                 return result
             log_line(f"Chosen date: {selected_date}")
 
-            # Click the day in flatpickr
+            # Click the day in flatpickr, ensuring it triggers even if previously selected
             day_sel = f'.flatpickr-day[aria-label="{selected_date}"]'
             if page.locator(day_sel).count() > 0:
-                page.click(day_sel)
+                page.evaluate(
+                    f"""() => {{
+                        const day = document.querySelector('.flatpickr-day[aria-label="{selected_date}"]');
+                        if (day) {{
+                            day.classList.add('selected');
+                            day.click();
+                        }}
+                    }}"""
+                )
             else:
-                # fallback JS
                 page.evaluate(
                     f"""() => {{
                         const days = document.querySelectorAll('.flatpickr-day');
@@ -575,6 +582,13 @@ def run_booker() -> dict:
                     }}
                 }}"""
             )
+            
+            # Wait for time slots to load asynchronously after date selection
+            try:
+                page.wait_for_selector('input[type="checkbox"][name="broneering[vastuvotud][]"]', timeout=10000)
+            except PlaywrightTimeout:
+                log_line("Timeout waiting for time slot checkboxes to render", file=sys.stderr)
+            
             wait_settle(page, 2)
             screenshot(page, "09_date_selected")
 
