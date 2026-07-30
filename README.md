@@ -150,16 +150,22 @@ Calling the venv's `python3` by its full path directly (rather than `source venv
 first) is deliberate — under cron, `source`-based activation was found to intermittently not
 take effect, causing `ModuleNotFoundError` on some runs.
 
-### 7. Set up cron for 30-second checks
+### 7. Set up cron for 10-second checks
 
-Cron's minimum native granularity is one minute, so two offset lines are used — one firing at
-`:00` of every minute, the other sleeping 30 seconds first — giving an effective 30-second
-cadence. Both share the same lock file so overlapping runs skip cleanly instead of stacking up.
+Cron's minimum native granularity is one minute, so six offset lines are used — each firing
+once a minute but staggered by 0/10/20/30/40/50 seconds via `sleep` — giving an effective
+10-second cadence. All six share the same lock file so overlapping runs skip cleanly instead
+of stacking up (expect a higher `SKIPPED` count than at looser intervals, since there's less
+slack before the next tick).
 
 ```bash
 cat > /tmp/current_cron << 'EOF'
 * * * * * /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
+* * * * * sleep 10; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
+* * * * * sleep 20; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
 * * * * * sleep 30; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
+* * * * * sleep 40; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
+* * * * * sleep 50; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
 EOF
 crontab /tmp/current_cron
 crontab -l   # verify it took
