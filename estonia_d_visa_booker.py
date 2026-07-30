@@ -219,15 +219,98 @@ def load_applicant_data() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# reCAPTCHA (2captcha)
+# reCAPTCHA (CapSolver default, 2captcha kept as a fallback option)
 # ---------------------------------------------------------------------------
+#
+# CAPTCHA_PROVIDER selects which service to use: "capsolver" (default) or
+# "2captcha". The two APIs are not compatible drop-ins for each other - each
+# has its own request/response shape, endpoint, and env var for the key - so
+# each gets its own implementation function; solve_recaptcha() just dispatches
+# to the selected one. Each provider's poll interval is specific to its own
+# function since it reflects that provider's own typical solve latency, not
+# anything shared - no cross-provider setting to keep in sync.
+
+CAPTCHA_PROVIDER = os.environ.get("CAPTCHA_PROVIDER", "capsolver").strip().lower()
+
 
 def solve_recaptcha(page_url: str, sitekey: str, timeout: int = 120) -> str:
+    log_line(f"Solving reCAPTCHA sitekey={sitekey[:12]}… (provider={CAPTCHA_PROVIDER})")
+    if CAPTCHA_PROVIDER == "2captcha":
+        return _solve_recaptcha_2captcha(page_url, sitekey, timeout)
+    if CAPTCHA_PROVIDER == "capsolver":
+        return _solve_recaptcha_capsolver(page_url, sitekey, timeout)
+    raise RuntimeError(
+        f"Unknown CAPTCHA_PROVIDER={CAPTCHA_PROVIDER!r} - expected 'capsolver' or '2captcha'"
+    )
+
+
+def _solve_recaptcha_capsolver(page_url: str, sitekey: str, timeout: int) -> str:
+    """
+    CapSolver uses a JSON task API:
+      - createTask: POST https://api.capsolver.com/createTask, JSON body with
+        clientKey + a task object of type ReCaptchaV2TaskProxyLess.
+      - getTaskResult: POST https://api.capsolver.com/getTaskResult, JSON body
+        with clientKey + taskId, polled until status == "ready", solution
+        token read from solution.gRecaptchaResponse.
+    errorId != 0 on either call indicates a hard failure (bad key, bad task,
+    etc.) - distinct from "still processing", which is status == "processing".
+    """
+    api_key = os.environ.get("CAPSOLVER_API_KEY")
+    if not api_key:
+        raise RuntimeError("CAPSOLVER_API_KEY not set")
+
+    resp = requests.post(
+        "https://api.capsolver.com/createTask",
+        json={
+            "clientKey": api_key,
+            "task": {
+                "type": "ReCaptchaV2TaskProxyLess",
+                "websiteURL": page_url,
+                "websiteKey": sitekey,
+            },
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if result.get("errorId"):
+        raise RuntimeError(f"CapSolver create task failed: {result}")
+    task_id = result["taskId"]
+    log_line(f"CapSolver task id={task_id}")
+
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(3)
+        poll = requests.post(
+            "https://api.capsolver.com/getTaskResult",
+            json={"clientKey": api_key, "taskId": task_id},
+            timeout=30,
+        )
+        poll.raise_for_status()
+        data = poll.json()
+        if data.get("errorId"):
+            raise RuntimeError(f"CapSolver error: {data}")
+        if data.get("status") == "ready":
+            log_line("CapSolver solved")
+            return data["solution"]["gRecaptchaResponse"]
+        if data.get("status") == "processing":
+            continue
+        raise RuntimeError(f"CapSolver unexpected status: {data}")
+    raise RuntimeError("CapSolver timed out")
+
+
+def _solve_recaptcha_2captcha(page_url: str, sitekey: str, timeout: int) -> str:
+    """
+    2captcha uses form-encoded in.php/res.php endpoints:
+      - in.php: submit the task, get back a numeric captcha_id.
+      - res.php: poll by id until status == 1, solved token in "request".
+      "CAPCHA_NOT_READY" (in the "request" field) is the "still working"
+      signal while status == 0.
+    """
     api_key = os.environ.get("TWOCAPTCHA_API_KEY")
     if not api_key:
         raise RuntimeError("TWOCAPTCHA_API_KEY not set")
 
-    log_line(f"Solving reCAPTCHA sitekey={sitekey[:12]}…")
     resp = requests.post(
         "http://2captcha.com/in.php",
         data={

@@ -62,13 +62,28 @@ chmod 600 applicant_data_real.json
 
 ```bash
 export ENABLE_BOOKER=1
-export TWOCAPTCHA_API_KEY="your_2captcha_key"
+export CAPSOLVER_API_KEY="your_capsolver_key"
 export APPLICANT_DATA_REAL="/home/abhijeetvyas13/estonia-d-visa-appointment/applicant_data_real.json"
 export APPLICANT_DATA_DUMMY="/home/abhijeetvyas13/estonia-d-visa-appointment/applicant_data_dummy.json"
 # optional overrides
 # export BOOKER_COOLDOWN_SECONDS=90
 # export DRY_RUN=1          # for testing – never submits
 # export FORCE_LIST_ONLY=1  # force Stage-2 only
+```
+
+**CAPTCHA provider**: defaults to CapSolver (faster observed solve times). Set
+`CAPTCHA_PROVIDER=2captcha` plus `TWOCAPTCHA_API_KEY` to fall back to 2captcha
+instead — both implementations are kept in the script, selectable via this
+one env var (default is `capsolver`, so no need to set it explicitly unless
+switching):
+
+```bash
+# default — no CAPTCHA_PROVIDER line needed:
+export CAPSOLVER_API_KEY="your_capsolver_key"
+
+# to use 2captcha instead:
+export CAPTCHA_PROVIDER=2captcha
+export TWOCAPTCHA_API_KEY="your_2captcha_key"
 ```
 
 ### Point cron at the hook (instead of the original monitor)
@@ -90,7 +105,7 @@ source venv/bin/activate
 export DRY_RUN=1
 export EMBASSY_ID=244          # Abu Dhabi has slots for testing
 export EMBASSY_NAME="Abu Dhabi"
-export TWOCAPTCHA_API_KEY=...
+export CAPSOLVER_API_KEY=...
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
 python3 estonia_d_visa_booker.py
