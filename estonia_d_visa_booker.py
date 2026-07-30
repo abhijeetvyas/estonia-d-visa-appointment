@@ -55,6 +55,15 @@ SERVICE_VALUE = "pikaajaline_viisa"  # stable backend value
 EMBASSY_ID = os.environ.get("EMBASSY_ID", "40")
 EMBASSY_NAME = os.environ.get("EMBASSY_NAME", "New Delhi")
 
+# Opt-in: run a real installed Chrome (not the bundled headless Chromium) and
+# optionally headed (visible window) instead of headless. Off by default so
+# VM/live behavior is completely unaffected - meant for local runs testing
+# whether a real browser + real residential IP reduces reCAPTCHA friction
+# versus a headless instance from a datacenter IP. Requires `playwright
+# install chrome` once (or an existing system Chrome install) if set.
+BROWSER_CHANNEL = os.environ.get("BROWSER_CHANNEL", "").strip() or None
+BROWSER_HEADLESS = os.environ.get("BROWSER_HEADLESS", "1").strip().lower() not in ("0", "false", "no")
+
 # Known reCAPTCHA sitekey (identical across embassies)
 RECAPTCHA_SITEKEY = "6Ld04R4nAAAAADJhUQpKyGxGh4zlfOsyk5VkVkzR"
 
@@ -506,7 +515,11 @@ def run_booker() -> dict:
             log_line(f"Attached to persistent Chromium at {cdp_url}")
         except Exception as e:
             log_line(f"Persistent Chromium not reachable ({e}) - launching a fresh instance", file=sys.stderr)
-            browser = p.chromium.launch(headless=True)
+            launch_kwargs: dict[str, Any] = {"headless": BROWSER_HEADLESS}
+            if BROWSER_CHANNEL:
+                launch_kwargs["channel"] = BROWSER_CHANNEL
+                log_line(f"Using browser channel={BROWSER_CHANNEL}, headless={BROWSER_HEADLESS}")
+            browser = p.chromium.launch(**launch_kwargs)
 
         context = browser.new_context(
             viewport={"width": 1280, "height": 900},

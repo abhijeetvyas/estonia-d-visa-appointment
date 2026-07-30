@@ -12,6 +12,7 @@ The original `estonia_visa_monitor.py` is **untouched**.
 | `applicant_data_dummy.json` | Dummy applicant data (safe to keep in repo for dry-runs) |
 | `applicant_data_real.json.example` | Template – copy to `applicant_data_real.json` **on the VM only** |
 | `BOOKER_README.md` | This file |
+| `persistent_chromium.py` | Optional: keeps one headless Chromium warm via CDP, cuts booking latency (see below) |
 | `requirements.txt` | Now also lists `playwright` |
 
 ## Three-stage behaviour
@@ -146,6 +147,114 @@ To confirm it's actually being used, look for this line in a run's log:
 see `Persistent Chromium not reachable ... launching a fresh instance`, the
 service isn't up (check `sudo systemctl status estonia-chromium` and
 `sudo journalctl -u estonia-chromium -n 50`).
+
+### VM sizing: the booker is much heavier than the plain monitor
+
+The base monitor (`estonia_visa_monitor.py`) is a lightweight `requests` call and runs fine
+forever on the free `e2-micro` tier. The booker launches a real headless Chromium and solves
+two reCAPTCHAs per run - a meaningfully heavier workload. In practice, running several booker
+dry-runs back-to-back on `e2-micro` showed clear CPU-credit exhaustion: `e2-micro`/`e2-small`/
+`e2-medium` are all **shared-core** machine types (baseline + burst credit model), and sustained
+Playwright load burns through the burst credit, causing later runs in a burst to get visibly
+slower across every step (not just CAPTCHA-dependent ones) - confirmed directly against the
+GCP Monitoring CPU Utilization graph, which showed clear spikes to 200% (both vCPUs pegged)
+during test runs.
+
+If you plan to actually rely on the booker (not just occasional dry-run testing), consider
+upgrading to a **non-shared-core** machine type - this removes the credit/throttling ceiling
+entirely:
+
+```bash
+# VM must be stopped first (Console → Compute Engine → your instance → Stop)
+gcloud compute instances set-machine-type estonia-visa-monitor \
+  --zone=us-central1-<your-zone> \
+  --machine-type=e2-standard-2
+# then Start again
+```
+
+This takes the VM out of Always Free tier eligibility (that's `e2-micro`-specific), so it starts
+incurring real billing - check current pricing before committing. Everything else (disk, venv,
+cron, systemd services, state files) survives untouched; only the machine type changes.
+
+If `e2-standard-2` hits a `ZONE_RESOURCE_POOL_EXHAUSTED` / capacity stockout error in your zone
+(a transient GCP-side issue, not a config problem), try again after a few minutes, or fall back
+to another non-shared-core type in the same zone (no migration needed, just another Edit
+attempt) - roughly in order of cost: `e2-standard-2` → `n2d-standard-2` → `n1-standard-2` →
+`n2-standard-2` → `t2d-standard-2` → `e2-standard-4`. All are 2 vCPU / ~8GB (except
+`e2-standard-4`, which is double that), all non-shared-core, all interchangeable for this
+purpose - whichever one actually has capacity wins.
+
+**If staying on a shared-core type** (`e2-micro` etc.), it's worth adding a small swap file as a
+cheap safety net - `e2-micro` ships with zero swap configured, so a memory spike (e.g. the
+persistent Chromium service permanently reserving ~250-300MB) can trigger the OOM killer
+outright instead of degrading gracefully:
+
+```bash
+sudo fallocate -l 1G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+### Real Memory/Disk monitoring (Ops Agent)
+
+The default GCP Monitoring dashboard only shows hypervisor-level metrics (CPU, network, disk
+throughput) out of the box - Memory Utilization and Disk Space Utilization panels show "No data
+available" until the **Ops Agent** is installed:
+
+```bash
+curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+sudo bash add-google-cloud-ops-agent-repo.sh --also-install
+```
+
+If, after installing, `sudo systemctl status google-cloud-ops-agent` shows `[API Check] Result:
+FAIL, Error code: MonApiPermissionErr` / `LogApiPermissionErr` in its logs, the VM's service
+account lacks permission to write to the Monitoring/Logging APIs - this is an instance-level
+**access scope** issue, not a package issue. Fix (VM must be stopped): Edit → **Identity and API
+access** → **Access scopes** → change to **"Allow full access to all Cloud APIs"** → Save →
+Start, then `sudo systemctl restart google-cloud-ops-agent`.
+
+### Running the booker locally instead of the VM
+
+The booker script also runs fine on a personal laptop, not just the VM - useful for faster
+iteration while developing/debugging, or for testing whether a real browser on a real
+residential IP gets easier CAPTCHA challenges than a headless instance from a GCP datacenter IP
+(a real hypothesis, unconfirmed - reCAPTCHA risk-scores on signals like IP reputation and
+browser fingerprint, and a fresh headless Chromium on a datacenter IP is about as high-risk a
+profile as it gets).
+
+```bash
+cd estonia-d-visa-appointment
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+playwright install chrome     # registers the real Chrome channel with Playwright
+```
+
+`applicant_data_dummy.json` is already in the repo, so `DRY_RUN=1` works immediately - no need
+to create `applicant_data_real.json` just to test locally. The SSL-certificate-chain workaround
+(`combined_ca_bundle.pem`, needed for the plain monitor's `requests` calls) is **not** needed
+here - the booker drives an actual browser via Playwright, and browsers already handle that
+certificate chain correctly on their own.
+
+Two extra env vars control the real-Chrome experiment, both off by default so VM/live behavior
+is completely unaffected:
+
+```bash
+export BROWSER_CHANNEL=chrome    # use real installed Chrome instead of bundled Chromium
+export BROWSER_HEADLESS=0        # run headed (visible window) instead of headless
+```
+
+Leave both unset to get the original headless-Chromium behavior. Note these only apply to the
+fresh-launch fallback path - they have no effect if a persistent Chromium (`persistent_chromium.py`)
+is reachable, since that path always attaches over CDP regardless.
+
+**Important:** running locally is a testing/iteration tool, not a replacement for the VM. The
+entire reason this project runs on a dedicated always-on VM is to catch a slot without a human
+or personal machine needing to be present - a local run only works while your laptop is on,
+awake, and the script is actively running.
 
 ### Dry-run test on the VM
 

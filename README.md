@@ -9,6 +9,10 @@ Alerts go out over two channels: Telegram (every single check where a slot is fo
 to multiple recipients) and an actual phone call via Twilio (throttled, since a ringing phone
 survives silent mode/Do Not Disturb in a way a push notification doesn't).
 
+**Looking for the automated booker add-on** (Playwright-driven auto-booking once a slot is
+detected, CAPTCHA solving, date/time selection, etc.)? That's a separate layer on top of this
+monitor — see `BOOKER_README.md`.
+
 ---
 
 ## Architecture, and why each piece was chosen
@@ -265,6 +269,22 @@ nano run_monitor.sh                    # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, T
 git status                              # confirm you're on gcp-setup and see any local diffs
 git pull                                # fetch latest from the tracked branch
 ```
+
+### Fixing a stale git lock (`index.lock` / `HEAD.lock`)
+
+If `git commit`/`git push`/etc. fail with something like:
+```
+fatal: Unable to create '.../.git/index.lock': File exists.
+Another git process seems to be running in this repository...
+```
+this is a leftover lock file from a previous git process that didn't clean up after itself
+(not an actual concurrent process still running - if you're not mid-`git commit` in another
+terminal/editor right now, it's safe to remove). Fix:
+```bash
+rm -f .git/index.lock    # or .git/HEAD.lock, whichever the error names
+git status               # confirm it's back to normal before retrying
+```
+Then retry the original `git add`/`commit`/`push` command.
 
 ---
 
