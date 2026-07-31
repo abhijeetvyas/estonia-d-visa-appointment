@@ -145,7 +145,7 @@ def send_telegram_text(message):
         print(f'Telegram send partially failed for some recipients: {"; ".join(errors)}', file=sys.stderr)
 
 
-RUNTIME_SIGNATURE = '\n\n— Sent from GCP'
+RUNTIME_SIGNATURE = f"\n\n— Sent from {os.environ.get('RUNTIME_LABEL', 'GCP')}"
 
 # Since the site is checked frequently, a slot staying open for a while
 # would otherwise trigger a phone call every single check — pointless once
@@ -258,7 +258,7 @@ def send_failure_alert(error_summary):
         f'booking calendar.\n\n'
         f'Error: {error_summary}\n\n'
         f'This means slot checks are not happening reliably until this is '
-        f'fixed. Check monitor.log on the VM for the full traceback.\n'
+        f"fixed. Check monitor.log on {os.environ.get('RUNTIME_LABEL', 'the VM')} for the full traceback.\n"
         f'(You will not be re-alerted for the same ongoing issue for '
         f'{_cooldown_hours_display()}.)'
         f'{RUNTIME_SIGNATURE}'

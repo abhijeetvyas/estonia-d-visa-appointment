@@ -35,6 +35,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -89,7 +90,7 @@ SCREENSHOT_DIR = SCRIPT_DIR / "booker_screenshots"
 if DRY_RUN:
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-RUNTIME_SIGNATURE = "\n\n— Sent from GCP booker"
+RUNTIME_SIGNATURE = f"\n\n— Sent from {os.environ.get('RUNTIME_LABEL', 'GCP')} booker"
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +485,48 @@ def choose_time(time_labels: list[str]) -> str | None:
 # Core booking flow
 # ---------------------------------------------------------------------------
 
+def _prefetch_captcha_worker(sitekey: str, page_url: str, result: dict) -> None:
+    try:
+        result["token"] = solve_recaptcha(page_url, sitekey)
+    except Exception as e:
+        result["error"] = e
+
+
+def get_recaptcha_token(
+    page, prefetch_sitekey: str, prefetch_thread: threading.Thread, prefetch_result: dict, timeout: int = 120
+) -> tuple[str, str]:
+    """
+    Returns (sitekey, token) for whatever reCAPTCHA is actually on the page
+    right now. Both CAPTCHAs are kicked off solving in the background at the
+    very start of run_booker() (see the two prefetch threads there) since
+    neither depends on any page state - just the (assumed-stable) sitekey and
+    the fixed page URL. If the page's real sitekey matches what was
+    prefetched, this just waits for/reuses that in-flight solve instead of
+    paying for a second one - potentially saving its entire solve time off
+    the critical path. Falls back to a fresh synchronous solve if the sitekey
+    doesn't match (e.g. the hardcoded constant went stale) or the prefetch
+    failed, so correctness never depends on the prefetch working - only speed
+    does.
+    """
+    actual_sitekey = get_recaptcha_sitekey(page) or RECAPTCHA_SITEKEY
+    if actual_sitekey == prefetch_sitekey:
+        prefetch_thread.join(timeout=timeout)
+        if prefetch_result.get("token"):
+            log_line("Using prefetched reCAPTCHA token (solved in background)")
+            return actual_sitekey, prefetch_result["token"]
+        if prefetch_result.get("error"):
+            log_line(
+                f"Prefetched captcha solve failed ({prefetch_result['error']}) - solving fresh",
+                file=sys.stderr,
+            )
+    else:
+        log_line(
+            f"Page sitekey ({actual_sitekey[:12]}…) doesn't match prefetch - solving fresh",
+            file=sys.stderr,
+        )
+    return actual_sitekey, solve_recaptcha(URL, actual_sitekey, timeout)
+
+
 def run_booker() -> dict:
     applicant = load_applicant_data()
     list_only = FORCE_LIST_ONLY or is_already_booked()
@@ -496,6 +539,23 @@ def run_booker() -> dict:
         "embassy": EMBASSY_ID,
         "embassy_name": EMBASSY_NAME,
     }
+
+    # Kick off both reCAPTCHA solves in the background immediately, in
+    # parallel with everything else (browser launch, page navigation, form
+    # filling). Each solve takes 15-40s+ and doesn't depend on any page
+    # state, so there's no reason to wait until we're actually on that step
+    # to start - especially the second one, which historically isn't needed
+    # until 50-90s into the run, by which point it's likely already done.
+    prefetch1_result: dict[str, Any] = {}
+    prefetch2_result: dict[str, Any] = {}
+    prefetch1_thread = threading.Thread(
+        target=_prefetch_captcha_worker, args=(RECAPTCHA_SITEKEY, URL, prefetch1_result), daemon=True
+    )
+    prefetch2_thread = threading.Thread(
+        target=_prefetch_captcha_worker, args=(RECAPTCHA_SITEKEY, URL, prefetch2_result), daemon=True
+    )
+    prefetch1_thread.start()
+    prefetch2_thread.start()
 
     with sync_playwright() as p:
         # Cold-launching Chromium from scratch costs 10-30s+ on this VM (worse
@@ -570,8 +630,7 @@ def run_booker() -> dict:
             screenshot(page, "04_service_selected")
 
             # ----- First reCAPTCHA -----
-            sitekey1 = get_recaptcha_sitekey(page) or RECAPTCHA_SITEKEY
-            token1 = solve_recaptcha(URL, sitekey1)
+            sitekey1, token1 = get_recaptcha_token(page, RECAPTCHA_SITEKEY, prefetch1_thread, prefetch1_result)
             inject_recaptcha(page, token1)
             time.sleep(1)
             screenshot(page, "05_captcha1_injected")
@@ -800,8 +859,7 @@ def run_booker() -> dict:
 
             # ----- Second reCAPTCHA -----
             time.sleep(2)  # give async reCAPTCHA a moment
-            sitekey2 = get_recaptcha_sitekey(page) or RECAPTCHA_SITEKEY
-            token2 = solve_recaptcha(URL, sitekey2)
+            sitekey2, token2 = get_recaptcha_token(page, RECAPTCHA_SITEKEY, prefetch2_thread, prefetch2_result)
             inject_recaptcha(page, token2)
             time.sleep(1)
             screenshot(page, "12_captcha2_injected")

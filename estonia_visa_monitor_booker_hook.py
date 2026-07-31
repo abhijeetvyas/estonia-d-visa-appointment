@@ -63,7 +63,7 @@ def trigger_booker() -> None:
         try:
             mon.send_telegram_text(
                 f"⚠️ Failed to launch D-visa booker for {mon.EMBASSY_NAME}: {e}\n\n"
-                f"— Sent from GCP"
+                f"— Sent from {os.environ.get('RUNTIME_LABEL', 'GCP')}"
             )
         except Exception:
             pass

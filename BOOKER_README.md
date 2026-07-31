@@ -87,6 +87,16 @@ export CAPTCHA_PROVIDER=2captcha
 export TWOCAPTCHA_API_KEY="your_2captcha_key"
 ```
 
+**Both CAPTCHAs are pre-solved in the background from the very start of a run**, not just when
+each step is reached - neither depends on any page state, only the (assumed-stable) sitekey and
+page URL, both known constants before the browser even opens. The second CAPTCHA in particular
+historically isn't needed until 50-90s into the run, by which point its background solve is
+usually already done, cutting its wait out of the critical path entirely. This is safe by
+construction: if the page's real sitekey ever doesn't match what was prefetched, it just falls
+back to solving fresh exactly like before - correctness never depends on the prefetch working,
+only speed does. Look for `Using prefetched reCAPTCHA token (solved in background)` in the logs
+to confirm it's actually kicking in.
+
 ### Point cron at the hook (instead of the original monitor)
 
 Edit `run_monitor.sh` so the final Python line becomes:
