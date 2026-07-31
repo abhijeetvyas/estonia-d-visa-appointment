@@ -85,7 +85,24 @@ export CAPSOLVER_API_KEY="your_capsolver_key"
 # to use 2captcha instead:
 export CAPTCHA_PROVIDER=2captcha
 export TWOCAPTCHA_API_KEY="your_2captcha_key"
+
+# to race both simultaneously and take whichever solves first:
+export CAPTCHA_PROVIDER=race
+export CAPSOLVER_API_KEY="your_capsolver_key"
+export TWOCAPTCHA_API_KEY="your_2captcha_key"
 ```
+
+**`CAPTCHA_PROVIDER=race`**: fires both CapSolver and 2captcha concurrently for the same
+challenge and keeps whichever result arrives first - reduces the odds of a slow solve on one
+provider blocking a step, since solve times vary run to run (observed 12-40s+ on CapSolver
+alone). Real cost trade-off, not a free win: both are pay-per-successful-solve services, and
+since neither has a "cancel this task" API, the losing solve still runs to completion in the
+background and still gets billed on the vendor's side - realistically this means paying both
+providers on nearly every real attempt, not just the one whose token you end up using. Only
+sensible because this runs at real trigger time (rare slot-detection events), not continuously -
+the extra cost is a fraction of a cent per real attempt, not an ongoing drain. Requires both
+`CAPSOLVER_API_KEY` and `TWOCAPTCHA_API_KEY` set; if only one key is present the "race" still
+works, it just trivially finishes via whichever one has a valid key.
 
 **Both CAPTCHAs are pre-solved in the background from the very start of a run**, not just when
 each step is reached - neither depends on any page state, only the (assumed-stable) sitekey and

@@ -8,9 +8,15 @@ before making any changes.
 
 Repo: `https://github.com/abhijeetvyas/estonia-d-visa-appointment`
 Human owner: Abhijeet Vyas.
-Live branch: **`gcp-setup`** — this is the branch actually running in production, on a GCP VM.
+Live branch: **`gcp-setup`** was the original detection-only branch. **`gcp-booker`** is where
+all subsequent development happened — it adds a Playwright-driven auto-booker on top of the
+original monitor (see section 8 for its full reasoning trail). As of this writing, `gcp-booker`
+has been extensively validated via `DRY_RUN=1` dry-runs on the VM but confirm with the human
+whether `run_monitor.sh` has actually been pointed at `estonia_visa_monitor_booker_hook.py`
+(live) versus still calling `estonia_visa_monitor.py` directly (detection-only) before assuming
+which mode is currently live in production.
 `main` is stale — it only contains the original GitHub-Actions-only version of this project
-and should NOT be assumed to reflect current behavior. Always work from `gcp-setup` unless
+and should NOT be assumed to reflect current behavior. Always work from `gcp-booker` unless
 told otherwise, and confirm the current default/production branch with the human before
 assuming `main` is authoritative.
 
@@ -125,18 +131,42 @@ speculation:
 
 ## 3. Current infrastructure (as of last known state)
 
-- **Host**: Google Cloud Compute Engine, `e2-micro`, region `us-central1`, Debian, Always Free
-  tier eligible configuration (standard persistent disk ≤30GB, Standard provisioning model,
-  not Spot).
+- **Host**: Google Cloud Compute Engine, region `us-central1`. **Originally `e2-micro`**
+  (Always Free tier), **upgraded to `e2-standard-2`** (2 vCPU dedicated, 8GB RAM, non-shared-
+  core) after the booker's Playwright/Chromium workload was observed exhausting `e2-micro`'s
+  CPU burst credits under sustained load (confirmed directly against the GCP Monitoring CPU
+  Utilization graph — visible spikes to 200%, i.e. both shared vCPUs pegged, during back-to-
+  back dry-runs). This upgrade takes the VM out of Always Free eligibility and incurs real
+  billing — see `BOOKER_README.md`'s "VM sizing" section for the fallback machine-type order
+  (`n2d-standard-2`, `n1-standard-2`, `n2-standard-2`, `t2d-standard-2`, `e2-standard-4`) if
+  `e2-standard-2` hits a `ZONE_RESOURCE_POOL_EXHAUSTED` capacity stockout in this zone (a
+  transient GCP-side issue, not a config problem — happened repeatedly in `us-central1-a`).
 - **VM hostname**: `estonia-visa-monitor`. **Linux user**: `abhijeetvyas13`.
 - **Repo location on VM**: `/home/abhijeetvyas13/estonia-d-visa-appointment`, on branch
-  `gcp-setup`.
-- **Python environment**: a `venv` at `venv/` inside the repo directory, with `requests` and
-  `beautifulsoup4` installed per `requirements.txt`.
+  `gcp-booker`.
+- **Python environment**: a `venv` at `venv/` inside the repo directory, with `requests`,
+  `beautifulsoup4`, and `playwright` installed per `requirements.txt` (`playwright install
+  chromium` also required, done separately from `pip install`).
+- **Persistent Chromium**: `persistent_chromium.py` runs as a systemd service
+  (`estonia-chromium.service`, enabled, `Restart=always`) keeping one headless Chromium warm
+  with a local CDP port (`127.0.0.1:9222`) open — the booker attaches via
+  `connect_over_cdp()` instead of paying Chromium's cold-start cost (10-30s+, worse under the
+  old CPU throttling) on every triggered run. Falls back to a fresh launch automatically if
+  unreachable, so this being down doesn't block real bookings, only slows them.
+- **Google Cloud Ops Agent**: installed for real Memory/Disk Monitoring dashboard visibility
+  (the default dashboard only shows hypervisor-level metrics without it). Has repeatedly shown
+  `[API Check] Result: FAIL, MonApiPermissionErr/LogApiPermissionErr` in its own status logs —
+  this is an IAM issue, not an access-scope issue: the instance's "Allow full access to all
+  Cloud APIs" access scope being set is necessary but not sufficient; the VM's service account
+  (the default Compute Engine one, `<project-number>-compute@developer.gserviceaccount.com`)
+  also needs the `Monitoring Metric Writer` and `Logs Writer` IAM roles granted directly in
+  IAM & Admin → IAM. Check this is actually done before assuming Ops Agent monitoring works.
 - **Not tracked in git** (exist only on the VM, must be manually recreated if the VM is
   rebuilt): `run_monitor.sh` (contains all secrets as `export` statements), `venv/`,
   `combined_ca_bundle.pem`, `yr2_intermediate.der`/`.pem`, `.state/` (per-embassy JSON cooldown
-  state), `monitor.log` and its rotations, `alerts_history.log`.
+  state, now also per-embassy booker state via `.state/booker_state_<EMBASSY_ID>.json`),
+  `monitor.log` and its rotations, `alerts_history.log`, `applicant_data_real.json`,
+  `booker_screenshots/` and `booker.log` (booker-specific, dry-run/debug artifacts).
 - **Scheduling**: system `cron` (via `crontab`), six lines for 10-second cadence (see section
   2, point 11), each wrapped in `flock -n /tmp/estonia_visa_monitor.lock`.
 - **Log rotation**: `/etc/logrotate.d/estonia-visa-monitor`, daily, 7 rotations kept,
@@ -179,11 +209,16 @@ speculation:
   for anything that should be timestamped in `monitor.log`.
 - `record_alert()`: appends a timestamped line to `alerts_history.log`. Only called for real
   AVAILABLE/FAILURE events, never for routine "not available" or test events.
-- `RUNTIME_SIGNATURE`: appended to every Telegram message body, currently
-  `'\n\n— Sent from GCP'` — this exists so the human can visually confirm which system (this
-  one, vs. any old/duplicate automation) actually sent a given alert. If this system is ever
-  migrated off GCP again, update this string to match, and check `send_failure_alert()`'s text
-  which also references "the VM" explicitly.
+- `RUNTIME_SIGNATURE`: appended to every Telegram message body,
+  `f"\n\n— Sent from {os.environ.get('RUNTIME_LABEL', 'GCP')}"` — the machine identifier is
+  now driven by the `RUNTIME_LABEL` env var (defaults to `'GCP'`, unchanged behavior if unset)
+  rather than a hardcoded string. This was made configurable specifically to support running
+  the monitor/booker on multiple machines in parallel (e.g. the VM and a personal laptop
+  simultaneously, both racing to catch the same slot) and being able to tell from the Telegram
+  alert which one actually fired — set `RUNTIME_LABEL="Mac"` (or similar) on any non-VM runtime.
+  The same env var also drives the equivalent hardcoded strings in
+  `estonia_visa_monitor_booker_hook.py` and the "Check monitor.log on {X}" text in
+  `send_failure_alert()` — all three were updated together, don't assume only one was.
 
 ## 5. Required environment variables (all set in `run_monitor.sh`, none are defaults except embassy)
 
@@ -200,6 +235,7 @@ speculation:
 | `EMBASSY_ID` | Optional, defaults to `'40'` (New Delhi) | Numeric `esindus` value from the site's own dropdown |
 | `EMBASSY_NAME` | Optional, defaults to `'New Delhi'` | Human-readable, used in alert text only |
 | `TEST_TELEGRAM` | Optional, unset by default | Set to `true` to trigger test-mode (see `send_test_alert`) |
+| `RUNTIME_LABEL` | Optional, defaults to `'GCP'` | Identifies which machine sent an alert in the Telegram text — set differently per machine if running in parallel on more than one (see section 8) |
 
 ## 6. Command reference (also in README.md, repeated here for this doc's self-containedness)
 
@@ -254,3 +290,128 @@ crontab /tmp/current_cron
   is a live example). Treat `RuntimeError`s from `check_availability()` about "markup may have
   changed" as a signal to actually go look at the live site (e.g. via a real browser session)
   before assuming it's a transient bug.
+
+## 8. The booker (`estonia_d_visa_booker.py`, `gcp-booker` branch) — full reasoning trail
+
+Everything below happened after section 1-7 were written and describes a second system layered
+on top of the original monitor. `estonia_visa_monitor.py` itself was never modified by any of
+this — `estonia_visa_monitor_booker_hook.py` is the only file that imports it and, when a slot
+is found and `ENABLE_BOOKER=1`, launches the booker as a separate detached subprocess (so a
+booker crash can't take down the monitor's own 10-second cadence).
+
+**Why it exists**: detection alone wasn't enough — the first real slot the monitor caught was
+lost anyway, because by the time a human opened a laptop and clicked through the form, someone
+else had already taken it (one observed window: roughly 30 seconds). The booker exists to remove
+the human from that specific race.
+
+**Three-stage flow**: (1) detection, unchanged, handled by the original monitor; (2) reach the
+calendar, collect every available date/time, send a Telegram listing them — runs every time the
+booker is triggered, even if already booked; (3) select date/time per preference rules
+(`choose_date()`: latest date ≥3 days out, fallback earliest; `choose_time()`: earliest slot in
+12:00-14:00, fallback earliest overall), solve the second CAPTCHA, submit — skipped permanently
+once a persistent `booked` flag is set in `.state/booker_state_<EMBASSY_ID>.json`.
+
+**Bug: date/time selection silently returning empty, every single run, regardless of embassy or
+how many dates were available.** Root cause was two independent, compounding issues, both in the
+calendar-day-click code, neither of which looked anything like a "reading the wrong attribute"
+bug (which was the first, reasonable-but-incomplete hypothesis):
+1. The code compared flatpickr's rendered `aria-label` (a locale-formatted string like
+   `"August 18, 2026"`) against an ISO date string (`"2026-08-18"`) — a comparison that could
+   never once succeed, so the day-click silently never fired. No exception, no timeout, just a
+   no-op. Fixed by matching on the day-of-month number within the currently-rendered month
+   instead (locale-independent) — flatpickr already auto-navigates to the correct month.
+2. A second, separate piece of code was manually setting the hidden `broneering[kuupaev]` input
+   to the raw ISO string and dispatching generic `change`/`input` DOM events on it. The
+   Stimulus/Turbo controller backing this form expects `DD.MM.YYYY` and drives off flatpickr's
+   own `onChange` — feeding it a malformed value this way was actively resetting/reloading the
+   form, wiping out whatever slots the (now-fixed) day-click had just correctly loaded. Fixed by
+   driving flatpickr's own `input._flatpickr.setDate(dateStr, true)` API instead, which handles
+   formatting and fires the real internal `onChange` the Stimulus controller is listening for.
+   Falls back to the day-of-month click if `_flatpickr` isn't found on the input (observed to
+   happen in practice on the live VM, harmlessly — the fallback works fine).
+   **A second, independently-run AI agent found bug #2 (the Stimulus/Turbo reset) while missing
+   bug #1 (the aria-label mismatch) that had already been found and fixed here.** Neither
+   diagnosis was wrong; neither was complete alone. If debugging this class of "reached the
+   right state but data came back empty" bug again, don't assume a single diagnosis (from any
+   source, human or AI) is the whole story — cross-check independently before declaring it fixed.
+   Also hardened while here: time-slot extraction now pairs each checkbox with its real label via
+   `label[for=checkbox.id]` (not DOM-proximity guessing or a page-wide div/span text scan), and
+   selects the target slot by its exact value (internal slot ID, e.g. `"2249050"` — NOT the
+   displayed time, a separate thing worth knowing if this code is touched again) instead of fuzzy
+   text matching.
+
+**CAPTCHA solving, provider history**: originally 2captcha only (`TWOCAPTCHA_API_KEY`,
+`_solve_recaptcha_2captcha()`, observed solve times 21-67s). Switched to **CapSolver as the
+default** (`CAPSOLVER_API_KEY`, `_solve_recaptcha_capsolver()`, observed solve times mostly
+12-40s, i.e. usually faster but with real variance) after direct comparison. Both
+implementations were kept, not replaced — `CAPTCHA_PROVIDER` env var selects `capsolver`
+(default), `2captcha`, or `race` (see below). The two APIs are NOT compatible drop-ins for each
+other (different endpoints, request/response shapes, polling semantics) — this is why there are
+two separate `_solve_recaptcha_*` functions with `solve_recaptcha()` as a thin dispatcher, not
+one function with an if/else on request format.
+
+**`CAPTCHA_PROVIDER=race`**: fires both CapSolver and 2captcha concurrently for the same
+challenge, keeps whichever result arrives first, discards the other. Added deliberately despite
+doubling cost on nearly every real attempt (both are pay-per-successful-solve, not pay-per-
+request, and neither has a cancel-in-flight-task API, so the losing solve still completes and
+still gets billed) — accepted because this only runs at real trigger time (rare slot-detection
+events), not continuously, so the extra cost is trivial in absolute terms. **Do not confuse this
+with, or reintroduce, a continuously-refreshed CAPTCHA-token "reserve"** (an idea considered and
+explicitly rejected) — since these services bill per successful solve regardless of whether the
+resulting token is ever used, continuously pre-solving on a timer (independent of whether a real
+slot has actually appeared) would be a real, ongoing cost for zero benefit over the
+already-in-place background-prefetch-at-trigger-time approach, and most pre-solved tokens would
+go stale anyway (reCAPTCHA v2 tokens are valid roughly 2 minutes) before a real, randomly-timed
+trigger event ever aligned with them.
+
+**Background CAPTCHA prefetching**: both `solve_recaptcha()` calls (one per CAPTCHA in the flow)
+are now preceded by kicking off background solves for both CAPTCHAs at the very start of
+`run_booker()`, before the browser even launches — via `_prefetch_captcha_worker()` and two
+daemon threads, using the hardcoded `RECAPTCHA_SITEKEY` constant and known `URL` (neither depend
+on any page state). `get_recaptcha_token()` compares the page's actual extracted sitekey against
+what was prefetched; if they match, it just waits for/reuses the in-flight solve; if they don't
+(e.g. the hardcoded constant went stale), it falls back to a fresh synchronous solve exactly like
+before — **safe by construction, correctness never depends on the prefetch working, only speed
+does.** This is the single biggest speed win in the whole booker: CAPTCHA #2 in particular isn't
+needed until 50-90s into a typical run, by which point its background solve is very often already
+done, removing its entire wait from the critical path. Measured effect: a full dry-run went from
+the 90-130s range down to as little as 31s in one run (though NOT reliably every run — a
+41s run showed each CAPTCHA still causing a partial synchronous wait when that particular solve
+happened to be slower than the page-navigation time available to hide behind it; this variance is
+exactly what `CAPTCHA_PROVIDER=race` is meant to reduce). **Known unhardened edge case**: the
+prefetch result isn't checked for staleness/age before use — if a run were ever unusually slow
+(approaching the ~2-minute reCAPTCHA token validity window) before reaching CAPTCHA #2, the
+prefetched token could theoretically have expired; this hasn't happened in practice (runs are
+well under that window) but would be worth adding a staleness check for if it ever does.
+
+**Persistent Chromium (`persistent_chromium.py`)**: see section 3. Attach-or-fallback logic lives
+in `run_booker()`'s browser-acquisition block — `connect_over_cdp()` first, fresh
+`p.chromium.launch()` on any failure. The `finally` block only calls `browser.close()` if a fresh
+browser was launched (`used_persistent_browser` flag) — closing a shared, persistent instance
+here would kill it for every future run relying on it, not just this one.
+
+**Local/laptop-specific env vars** (all opt-in, default off, VM/live behavior completely
+unaffected by any of them): `BROWSER_CHANNEL=chrome` (real installed Chrome instead of bundled
+Chromium), `BROWSER_HEADLESS=0` (visible window), `BROWSER_USER_DATA_DIR=<path>` (persist
+cookies/history/local storage across runs via `launch_persistent_context()` — mutually exclusive
+with the persistent-Chromium-over-CDP path, takes priority if set, since it's solving a different
+problem: profile/fingerprint continuity, not launch-speed). These exist to test an unconfirmed
+hypothesis — that a real Chrome browser on a real residential IP with real browsing history gets
+easier reCAPTCHA challenges than a headless instance from a GCP datacenter IP, since reCAPTCHA
+risk-scores on signals like IP reputation and fingerprint. **This has not been confirmed or
+disproven yet** — treat it as a hypothesis worth testing (compare CAPTCHA difficulty/frequency
+between a VM run and a warmed-up-profile local run), not an established fact. When
+`BROWSER_CHANNEL` is set, the context is deliberately NOT given the hardcoded fake `user_agent`
+string that the plain-Chromium fallback path uses — overriding a real Chrome's UA risks a
+version/platform mismatch that's itself a detectable inconsistency; let the real browser report
+its own true identity.
+
+**Running in parallel on multiple machines**: the VM and a personal laptop can both run the full
+monitor+booker pipeline simultaneously, watching/racing independently — explicitly decided as
+acceptable despite there being **no shared state between machines**. Each machine has its own
+`.state/` directory, so if both detect the same slot and both attempt to book it, there is a real
+possibility of both submitting near-simultaneously with no coordination preventing it. This was a
+deliberate, informed choice (not an oversight) made when weighing redundancy against that risk —
+if this behavior is ever revisited, that trade-off was made knowingly, not missed.
+`RUNTIME_LABEL` (section 5) exists specifically so alerts are distinguishable by source machine
+when running this way.

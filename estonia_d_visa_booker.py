@@ -243,26 +243,76 @@ def load_applicant_data() -> dict:
 # reCAPTCHA (CapSolver default, 2captcha kept as a fallback option)
 # ---------------------------------------------------------------------------
 #
-# CAPTCHA_PROVIDER selects which service to use: "capsolver" (default) or
-# "2captcha". The two APIs are not compatible drop-ins for each other - each
-# has its own request/response shape, endpoint, and env var for the key - so
-# each gets its own implementation function; solve_recaptcha() just dispatches
-# to the selected one. Each provider's poll interval is specific to its own
-# function since it reflects that provider's own typical solve latency, not
-# anything shared - no cross-provider setting to keep in sync.
+# CAPTCHA_PROVIDER selects which service to use: "capsolver" (default),
+# "2captcha", or "race" (both, concurrently - whichever finishes first wins).
+# The two APIs are not compatible drop-ins for each other - each has its own
+# request/response shape, endpoint, and env var for the key - so each gets
+# its own implementation function; solve_recaptcha() just dispatches to the
+# selected one. Each provider's poll interval is specific to its own function
+# since it reflects that provider's own typical solve latency, not anything
+# shared - no cross-provider setting to keep in sync.
+#
+# On "race": both CapSolver and 2captcha are reliable paid services, so in
+# the normal case BOTH independently succeed - this just keeps whichever
+# result arrives first and discards the other. Since billing is per
+# successful solve (not per request) on both services, this genuinely does
+# cost extra - realistically both get billed on nearly every real attempt,
+# not just the one whose token gets used. That's an intentional trade-off
+# here, not an oversight: it only runs at real trigger time (rare
+# slot-detection events), not continuously, so the extra cost is a fraction
+# of a cent per real attempt rather than an ongoing drain.
 
 CAPTCHA_PROVIDER = os.environ.get("CAPTCHA_PROVIDER", "capsolver").strip().lower()
 
 
 def solve_recaptcha(page_url: str, sitekey: str, timeout: int = 120) -> str:
     log_line(f"Solving reCAPTCHA sitekey={sitekey[:12]}… (provider={CAPTCHA_PROVIDER})")
+    if CAPTCHA_PROVIDER == "race":
+        return _race_solve_recaptcha(page_url, sitekey, timeout)
     if CAPTCHA_PROVIDER == "2captcha":
         return _solve_recaptcha_2captcha(page_url, sitekey, timeout)
     if CAPTCHA_PROVIDER == "capsolver":
         return _solve_recaptcha_capsolver(page_url, sitekey, timeout)
     raise RuntimeError(
-        f"Unknown CAPTCHA_PROVIDER={CAPTCHA_PROVIDER!r} - expected 'capsolver' or '2captcha'"
+        f"Unknown CAPTCHA_PROVIDER={CAPTCHA_PROVIDER!r} - expected 'capsolver', '2captcha', or 'race'"
     )
+
+
+def _race_solve_recaptcha(page_url: str, sitekey: str, timeout: int) -> str:
+    """
+    Fire both providers concurrently for the same challenge; return whichever
+    finishes first. Neither API supports cancelling an in-flight task, so the
+    losing solve just keeps running to completion in the background and its
+    result is discarded - it still gets billed on the vendor's side, which is
+    the accepted cost of this mode (see comment above).
+    """
+    outcomes: dict[str, dict] = {"capsolver": {}, "2captcha": {}}
+
+    def _run(name: str, fn) -> None:
+        try:
+            outcomes[name]["token"] = fn(page_url, sitekey, timeout)
+        except Exception as e:
+            outcomes[name]["error"] = e
+
+    threads = [
+        threading.Thread(target=_run, args=("capsolver", _solve_recaptcha_capsolver), daemon=True),
+        threading.Thread(target=_run, args=("2captcha", _solve_recaptcha_2captcha), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    start = time.time()
+    while time.time() - start < timeout:
+        for name, outcome in outcomes.items():
+            if outcome.get("token"):
+                log_line(f"Race won by {name}")
+                return outcome["token"]
+        time.sleep(0.25)
+
+    errors = [f"{name}: {o['error']}" for name, o in outcomes.items() if o.get("error")]
+    if errors:
+        raise RuntimeError(f"Both captcha providers failed: {'; '.join(errors)}")
+    raise RuntimeError("Both captcha providers timed out")
 
 
 def _solve_recaptcha_capsolver(page_url: str, sitekey: str, timeout: int) -> str:
