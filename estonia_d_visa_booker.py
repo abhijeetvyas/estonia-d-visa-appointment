@@ -95,6 +95,12 @@ BOOKER_COOLDOWN_SECONDS = int(os.environ.get("BOOKER_COOLDOWN_SECONDS", "90"))
 LOCK_STALE_SECONDS = 180
 
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
+# DRY_RUN alone = original preview-only behavior (stops one screen short of the
+# final submit, exactly like before). Set DRY_RUN_TEST_SUBMIT=1 as well to opt
+# into the newer flow that actually clicks submit and deletes the resulting
+# test booking - a real (if brief) write to the live site, so it's opt-in on
+# top of DRY_RUN rather than DRY_RUN's default behavior.
+DRY_RUN_TEST_SUBMIT = os.environ.get("DRY_RUN_TEST_SUBMIT", "").lower() in ("1", "true", "yes")
 FORCE_LIST_ONLY = os.environ.get("FORCE_LIST_ONLY", "").lower() in ("1", "true", "yes")
 
 SCREENSHOT_DIR = SCRIPT_DIR / "booker_screenshots"
@@ -682,7 +688,7 @@ def run_booker() -> dict:
             # Select embassy + persons
             page.select_option('select[name="broneering[esindus]"]', EMBASSY_ID)
             page.fill('input[name="broneering[isikuteArv]"]', "1")
-            time.sleep(0.5)
+            time.sleep(0.2)
             screenshot(page, "02_embassy_selected")
 
             # Turbo submit to load service dropdown
@@ -728,7 +734,7 @@ def run_booker() -> dict:
                 raise RuntimeError(f"Target service not present. Options: {options}")
 
             service_sel.select_option(target_value)
-            time.sleep(0.5)
+            time.sleep(0.2)
             screenshot(page, "04_service_selected")
 
             # ----- First reCAPTCHA -----
@@ -760,7 +766,7 @@ def run_booker() -> dict:
                 'input[name="broneering[broneeringuIsikud][0][viisataotluseNumber]"]',
                 applicant["visa_application_number"],
             )
-            time.sleep(0.5)
+            time.sleep(0.2)
             screenshot(page, "07_applicant_filled")
 
             page.click('button[name="edasi"]')
@@ -919,13 +925,19 @@ def run_booker() -> dict:
                         'input[type="checkbox"][name="broneering[vastuvotud][]"]',
                         timeout=select_timeout_ms,
                     )
+                    # wait_settle() always does a full networkidle wait (up to
+                    # 15s) internally regardless of its sleep argument - see
+                    # the note on the earlier form-transition waits. Once
+                    # wait_for_selector already found the checkboxes, a short
+                    # plain sleep is enough; only fall back to the full,
+                    # slower settle when the selector genuinely never showed.
+                    time.sleep(0.3)
                 except PlaywrightTimeout:
                     log_line(
                         f"Timeout waiting for time slot checkboxes to render (attempt {attempt}/{MAX_SLOT_ATTEMPTS})",
                         file=sys.stderr,
                     )
-
-                wait_settle(page, 2)
+                    wait_settle(page, 2)
 
                 # ----- Collect time slots for the chosen date -----
                 # The site's checkbox `value` attribute is an internal slot ID
@@ -1017,7 +1029,7 @@ def run_booker() -> dict:
 
             # Specifying information
             page.fill('textarea[name="broneering[markused]"]', applicant["specifying_information"])
-            time.sleep(0.5)
+            time.sleep(0.2)
             screenshot(page, "11_spec_filled")
 
             # ----- Second reCAPTCHA -----
@@ -1039,8 +1051,15 @@ def run_booker() -> dict:
             result["captcha2"] = True
 
             # ----- Final decision -----
-            if list_only or DRY_RUN:
-                log_line("Stopping before final submit (list-only or dry-run)")
+            if DRY_RUN and not DRY_RUN_TEST_SUBMIT:
+                # Original preview-only behavior: stop one screen short of the
+                # real submit. Set DRY_RUN_TEST_SUBMIT=1 alongside DRY_RUN=1 to
+                # instead exercise the real submit+delete flow below - both
+                # modes are available so you can pick per run.
+                log_line(
+                    "Stopping before final submit (dry-run preview only - "
+                    "set DRY_RUN_TEST_SUBMIT=1 to also test the real submit+delete flow)"
+                )
                 result["status"] = "list_only_or_dryrun"
                 result["message"] = (
                     f"Reached final page. Would have booked {selected_date} {selected_time}. "
@@ -1048,7 +1067,19 @@ def run_booker() -> dict:
                 )
                 return result
 
-            # LIVE submit
+            if not DRY_RUN and list_only:
+                log_line("Stopping before final submit (list-only)")
+                result["status"] = "list_only"
+                result["message"] = (
+                    f"Reached final page. Would have booked {selected_date} {selected_time}. "
+                    f"Submit skipped (mode={mode})."
+                )
+                return result
+
+            # ----- Click final submit -----
+            # DRY_RUN reaches here only when DRY_RUN_TEST_SUBMIT=1 is also set
+            # (see above) - same real submit click either way, only what
+            # happens after success/failure differs.
             log_line("Clicking final 'Book the appointment' (broneeri)")
             # button can be name=broneeri or type=submit with that text
             submit = page.locator('button[name="broneeri"], button:has-text("Book the appointment")')
@@ -1068,6 +1099,91 @@ def run_booker() -> dict:
                 selected_date.replace("-", "."),  # 18.08.2026 style
             ]
             success = any(m in page_text for m in confirmation_markers)
+
+            if DRY_RUN:
+                # DRY_RUN now performs a REAL submit against the live site (using
+                # applicant_data_dummy.json) instead of stopping short, so the
+                # final "does this actually work end to end" step gets tested
+                # too - previously untested territory. This creates a real
+                # appointment record under dummy applicant data; it is
+                # immediately deleted below via the site's own "Delete" action
+                # rather than left sitting on the real portal. Never marks
+                # `booked` state and never runs this path outside DRY_RUN.
+                if not success:
+                    result["status"] = "dryrun_submit_uncertain"
+                    result["message"] = (
+                        f"DRY_RUN: submit clicked for {EMBASSY_NAME} but confirmation markers not "
+                        f"found - check screenshots/portal manually (a test booking may exist)."
+                    )
+                    log_line(result["message"], file=sys.stderr)
+                    try:
+                        send_telegram(
+                            f"⚠️ DRY_RUN: submit was clicked for {EMBASSY_NAME} but confirmation "
+                            f"unclear - please check the portal manually for a leftover test "
+                            f"booking under dummy applicant data.{RUNTIME_SIGNATURE}"
+                        )
+                    except Exception as e:
+                        log_line(f"DRY_RUN uncertain-submit Telegram failed: {e}", file=sys.stderr)
+                    return result
+
+                log_line(f"DRY_RUN test booking succeeded ({selected_date} {selected_time}) - deleting it now")
+                deleted = False
+                try:
+                    # Auto-accept a native browser confirm() dialog if the site
+                    # uses one for the delete action, rather than a custom button.
+                    page.once("dialog", lambda dialog: dialog.accept())
+                    delete_btn = page.locator(
+                        'button:has-text("Delete"), a:has-text("Delete"), '
+                        'button:has-text("Cancel"), a:has-text("Cancel")'
+                    )
+                    if delete_btn.count() > 0:
+                        delete_btn.first.click()
+                        wait_settle(page, 2)
+                        # A second confirm step is common (e.g. "Are you sure?").
+                        confirm_btn = page.locator(
+                            'button:has-text("Confirm"), button:has-text("Yes"), button:has-text("Delete")'
+                        )
+                        if confirm_btn.count() > 0:
+                            confirm_btn.first.click()
+                            wait_settle(page, 2)
+                        screenshot(page, "14_after_delete")
+                        page_text_after = page.inner_text("body")
+                        deleted = "Booked time" not in page_text_after
+                    else:
+                        log_line(
+                            "DRY_RUN: no Delete/Cancel button found on confirmation page - "
+                            "could not clean up test booking, check screenshots for the actual markup",
+                            file=sys.stderr,
+                        )
+                except Exception as e:
+                    log_line(f"DRY_RUN delete step failed: {e}", file=sys.stderr)
+
+                result["status"] = "dryrun_booked_and_deleted" if deleted else "dryrun_booked_delete_failed"
+                result["message"] = (
+                    f"DRY_RUN: test-booked {selected_date} {selected_time} at {EMBASSY_NAME} and "
+                    + ("successfully deleted it - full flow verified end to end."
+                       if deleted else
+                       "FAILED to delete it afterward - a real test booking under dummy applicant "
+                       "data may still be sitting on the portal. Check and remove it manually!")
+                )
+                log_line(result["message"], file=None if deleted else sys.stderr)
+                try:
+                    send_telegram(
+                        (
+                            f"✅ DRY_RUN: test booking of {selected_date} {selected_time} at "
+                            f"{EMBASSY_NAME} succeeded, and the cleanup delete also succeeded - "
+                            f"full booking flow verified end to end."
+                            if deleted else
+                            f"⚠️ DRY_RUN: test booking of {selected_date} {selected_time} at "
+                            f"{EMBASSY_NAME} succeeded, but deleting it afterward FAILED. A test "
+                            f"booking under dummy applicant data may still be live on the portal - "
+                            f"please check and remove it manually."
+                        )
+                        + RUNTIME_SIGNATURE
+                    )
+                except Exception as e:
+                    log_line(f"DRY_RUN completion Telegram failed: {e}", file=sys.stderr)
+                return result
 
             if success:
                 details = {

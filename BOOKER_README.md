@@ -68,8 +68,9 @@ export APPLICANT_DATA_REAL="/home/abhijeetvyas13/estonia-d-visa-appointment/appl
 export APPLICANT_DATA_DUMMY="/home/abhijeetvyas13/estonia-d-visa-appointment/applicant_data_dummy.json"
 # optional overrides
 # export BOOKER_COOLDOWN_SECONDS=90
-# export DRY_RUN=1          # for testing – never submits
-# export FORCE_LIST_ONLY=1  # force Stage-2 only
+# export DRY_RUN=1               # for testing – preview only, stops before final submit
+# export DRY_RUN_TEST_SUBMIT=1   # with DRY_RUN=1: also submits + deletes a real test booking
+# export FORCE_LIST_ONLY=1       # force Stage-2 only
 ```
 
 **CAPTCHA provider**: defaults to CapSolver (faster observed solve times). Set
@@ -359,6 +360,44 @@ entire reason this project runs on a dedicated always-on VM is to catch a slot w
 or personal machine needing to be present - a local run only works while your laptop is on,
 awake, and the script is actively running.
 
+### Two dry-run modes: preview-only, or full submit + delete
+
+`DRY_RUN=1` alone keeps its original behavior unchanged - it stops one screen short of the final
+"Book the appointment" click, same as always. That preview never exercises the actual submit
+step, which is the one part of the flow most important to trust.
+
+Set `DRY_RUN_TEST_SUBMIT=1` **in addition to** `DRY_RUN=1` to instead run the fuller check: it
+clicks the real submit button (using `applicant_data_dummy.json`), confirms success the same way
+a live booking does, then immediately deletes the test booking via the site's own "Delete" (or
+"Cancel") action on the confirmation page, and sends a Telegram message reporting whether both
+the booking and the cleanup delete succeeded. It never calls `mark_booked()` (the persistent
+"already booked" state), so this has no effect on live-mode behavior either way.
+
+Both modes are available side by side - pick whichever fits what you're testing:
+
+```bash
+# Preview only (original behavior) - stops before the real submit click:
+export DRY_RUN=1
+
+# Full test - actually submits and then deletes the test booking:
+export DRY_RUN=1
+export DRY_RUN_TEST_SUBMIT=1
+```
+
+**Be aware this is a real write to Estonia's live booking system**, not a simulation - it creates
+an actual appointment record under dummy applicant data (`John Doe`, a fake email, a made-up visa
+application number) for the few seconds between submit and delete. It's deleted immediately after,
+but running this repeatedly against the production site is worth being deliberate about, not
+something to loop casually.
+
+If the delete step ever fails (e.g. the site's delete/cancel button text doesn't match what the
+code guesses - `Delete` or `Cancel` - or a second "are you sure?" confirmation step uses different
+wording), the booker logs `DRY_RUN: no Delete/Cancel button found...` or `DRY_RUN delete step
+failed: ...`, sends a ⚠️ Telegram alert instead of a ✅, and takes a `14_after_delete` screenshot
+either way so the actual page markup can be inspected and the selector corrected. **Check the
+portal manually if you ever see the ⚠️ message** - a stray test booking may be sitting there under
+dummy data until removed.
+
 ### Dry-run test on the VM
 
 ```bash
@@ -373,7 +412,9 @@ export TELEGRAM_CHAT_ID=...
 python3 estonia_d_visa_booker.py
 ```
 
-Screenshots land in `booker_screenshots/`. No real booking is performed.
+Screenshots land in `booker_screenshots/`. No real booking is performed with this preview-only
+invocation (add `export DRY_RUN_TEST_SUBMIT=1` above to also exercise the real submit+delete flow
+described above).
 
 ### Clearing the booked flag
 
