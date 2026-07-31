@@ -65,6 +65,17 @@ EMBASSY_NAME = os.environ.get("EMBASSY_NAME", "New Delhi")
 BROWSER_CHANNEL = os.environ.get("BROWSER_CHANNEL", "").strip() or None
 BROWSER_HEADLESS = os.environ.get("BROWSER_HEADLESS", "1").strip().lower() not in ("0", "false", "no")
 
+# Opt-in: persist the browser profile (cookies, local storage, history) to a
+# real directory on disk across runs, instead of a fresh empty profile every
+# time. Off by default. Only meaningful paired with BROWSER_CHANNEL=chrome -
+# a persistent profile is what actually lets real browsing history/session
+# age accumulate between runs, which a fresh-every-time profile never gets
+# regardless of using real Chrome. Mutually exclusive with the persistent-
+# Chromium-over-CDP path (that's a different kind of "persistent" - a warm
+# process for launch speed, not a warm profile for fingerprint/history) - if
+# this is set, the CDP-attach is skipped entirely and this takes priority.
+BROWSER_USER_DATA_DIR = os.environ.get("BROWSER_USER_DATA_DIR", "").strip() or None
+
 # Known reCAPTCHA sitekey (identical across embassies)
 RECAPTCHA_SITEKEY = "6Ld04R4nAAAAADJhUQpKyGxGh4zlfOsyk5VkVkzR"
 
@@ -567,29 +578,50 @@ def run_booker() -> dict:
         # versus a full process cold-start. Falls back to a fresh launch if
         # the persistent instance isn't reachable (not set up yet, crashed,
         # etc.) so this never blocks a real booking attempt.
-        cdp_url = os.environ.get("PERSISTENT_CHROMIUM_CDP_URL", "http://127.0.0.1:9222")
+        browser = None
         used_persistent_browser = False
-        try:
-            browser = p.chromium.connect_over_cdp(cdp_url, timeout=3000)
-            used_persistent_browser = True
-            log_line(f"Attached to persistent Chromium at {cdp_url}")
-        except Exception as e:
-            log_line(f"Persistent Chromium not reachable ({e}) - launching a fresh instance", file=sys.stderr)
-            launch_kwargs: dict[str, Any] = {"headless": BROWSER_HEADLESS}
-            if BROWSER_CHANNEL:
-                launch_kwargs["channel"] = BROWSER_CHANNEL
-                log_line(f"Using browser channel={BROWSER_CHANNEL}, headless={BROWSER_HEADLESS}")
-            browser = p.chromium.launch(**launch_kwargs)
 
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
+        if BROWSER_USER_DATA_DIR:
+            # Persistent-profile path: real cookies/history/session age
+            # accumulate in this directory across runs. Deliberately does NOT
+            # spoof a user_agent here - overriding a real Chrome's UA with a
+            # hardcoded string risks a version/platform mismatch that's
+            # itself a detectable inconsistency. Let the real browser report
+            # its own true identity.
+            persistent_kwargs: dict[str, Any] = {"headless": BROWSER_HEADLESS, "viewport": {"width": 1280, "height": 900}}
+            if BROWSER_CHANNEL:
+                persistent_kwargs["channel"] = BROWSER_CHANNEL
+            log_line(
+                f"Using persistent profile at {BROWSER_USER_DATA_DIR} "
+                f"(channel={BROWSER_CHANNEL or 'chromium'}, headless={BROWSER_HEADLESS})"
+            )
+            context = p.chromium.launch_persistent_context(BROWSER_USER_DATA_DIR, **persistent_kwargs)
+            page = context.pages[0] if context.pages else context.new_page()
+        else:
+            cdp_url = os.environ.get("PERSISTENT_CHROMIUM_CDP_URL", "http://127.0.0.1:9222")
+            try:
+                browser = p.chromium.connect_over_cdp(cdp_url, timeout=3000)
+                used_persistent_browser = True
+                log_line(f"Attached to persistent Chromium at {cdp_url}")
+            except Exception as e:
+                log_line(f"Persistent Chromium not reachable ({e}) - launching a fresh instance", file=sys.stderr)
+                launch_kwargs: dict[str, Any] = {"headless": BROWSER_HEADLESS}
+                if BROWSER_CHANNEL:
+                    launch_kwargs["channel"] = BROWSER_CHANNEL
+                    log_line(f"Using browser channel={BROWSER_CHANNEL}, headless={BROWSER_HEADLESS}")
+                browser = p.chromium.launch(**launch_kwargs)
+
+            context_kwargs: dict[str, Any] = {"viewport": {"width": 1280, "height": 900}}
+            if not BROWSER_CHANNEL:
+                # Only spoof a UA on the plain-Chromium path - a real Chrome
+                # (BROWSER_CHANNEL set) should report its own true UA.
+                context_kwargs["user_agent"] = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                )
+            context = browser.new_context(**context_kwargs)
+            page = context.new_page()
 
         try:
             # ----- Landing page -----
@@ -963,7 +995,7 @@ def run_booker() -> dict:
                 context.close()
             except Exception:
                 pass
-            if not used_persistent_browser:
+            if browser is not None and not used_persistent_browser:
                 browser.close()
 
 

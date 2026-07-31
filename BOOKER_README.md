@@ -249,17 +249,44 @@ to create `applicant_data_real.json` just to test locally. The SSL-certificate-c
 here - the booker drives an actual browser via Playwright, and browsers already handle that
 certificate chain correctly on their own.
 
-Two extra env vars control the real-Chrome experiment, both off by default so VM/live behavior
+Three extra env vars control the real-Chrome experiment, all off by default so VM/live behavior
 is completely unaffected:
 
 ```bash
-export BROWSER_CHANNEL=chrome    # use real installed Chrome instead of bundled Chromium
-export BROWSER_HEADLESS=0        # run headed (visible window) instead of headless
+export BROWSER_CHANNEL=chrome                       # use real installed Chrome instead of bundled Chromium
+export BROWSER_HEADLESS=0                            # run headed (visible window) instead of headless
+export BROWSER_USER_DATA_DIR=~/estonia-booker-profile # persist cookies/history across runs
 ```
 
-Leave both unset to get the original headless-Chromium behavior. Note these only apply to the
-fresh-launch fallback path - they have no effect if a persistent Chromium (`persistent_chromium.py`)
-is reachable, since that path always attaches over CDP regardless.
+Leave all unset to get the original headless-Chromium, fresh-profile-every-time behavior. Note
+`BROWSER_CHANNEL`/`BROWSER_HEADLESS` only apply to the fresh-launch fallback path - they have no
+effect if a persistent Chromium (`persistent_chromium.py`) is reachable, since that path always
+attaches over CDP regardless. `BROWSER_USER_DATA_DIR`, if set, **skips the persistent-Chromium
+path entirely** and takes priority - it's a different kind of "persistent" (a warm profile for
+fingerprint/history, not a warm process for launch speed) and the two aren't meant to combine.
+
+**Why `BROWSER_USER_DATA_DIR` matters for the experiment:** without it, every run starts from a
+completely empty, cookie-less, history-less profile - even with real Chrome, that's still a
+fresh/anonymous-looking session every time. A real browser's trust signal comes partly from
+session *age*, not just which binary is running. Pointing this at a real directory on disk lets
+cookies/local storage/history actually accumulate across runs.
+
+**Where to point it - a safety trade-off, not just a preference:**
+- **Recommended: a new, dedicated profile** (e.g. `~/estonia-booker-profile`) used only for this.
+  It starts empty on first run, but you can "warm it up" by opening that same profile in real
+  Chrome yourself between automated runs (`open -a "Google Chrome" --args --user-data-dir=~/estonia-booker-profile`
+  on macOS) and browsing normally for a bit - logging into a Google account, visiting a few
+  everyday sites - so it accumulates some organic history rather than staying a blank slate.
+- **Not recommended, at least not for a first test: your actual daily Chrome profile.** This
+  would give the most authentic signal (years of real history), but you can't run your normal
+  Chrome and this automation against the same profile directory at the same time (profile-lock
+  conflicts), and anything that goes wrong happens under your real identity/logged-in sessions,
+  not a disposable one. Start with a dedicated profile; only consider this later if the dedicated
+  one demonstrably isn't enough.
+
+Given both changes here are unconfirmed hypotheses, not established fixes, the honest way to use
+this is comparatively: run a few dry-runs with a fresh profile, then a few with a warmed-up
+`BROWSER_USER_DATA_DIR` profile, and see whether CAPTCHA difficulty/frequency actually differs.
 
 **Important:** running locally is a testing/iteration tool, not a replacement for the VM. The
 entire reason this project runs on a dedicated always-on VM is to catch a slot without a human
