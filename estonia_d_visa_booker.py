@@ -696,7 +696,15 @@ def run_booker() -> dict:
                     'select[name="broneering[toiming]"], select#broneering_toiming',
                     timeout=8000,
                 )
-                wait_settle(page, 0.3)
+                # NOTE: wait_settle() always does a full networkidle wait (up to
+                # 15s) internally regardless of the number passed to it - that
+                # argument only controls its trailing fixed sleep. Once
+                # wait_for_selector already confirms the target element is
+                # there, a plain short sleep is enough; calling wait_settle()
+                # here would silently re-pay that up to 15s networkidle cost
+                # and defeat the entire point of this optimization (this site's
+                # Turbo/websocket traffic rarely goes fully idle).
+                time.sleep(0.3)
             except PlaywrightTimeout:
                 log_line("Service dropdown didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
                 wait_settle(page, 2.5)
@@ -735,7 +743,7 @@ def run_booker() -> dict:
                     'input[name="broneering[broneeringuIsikud][0][eesnimi]"]',
                     timeout=8000,
                 )
-                wait_settle(page, 0.3)
+                time.sleep(0.3)  # see note above - wait_settle() would re-pay the full networkidle cost
             except PlaywrightTimeout:
                 log_line("Applicant form didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
                 wait_settle(page, 3)
@@ -758,7 +766,7 @@ def run_booker() -> dict:
             page.click('button[name="edasi"]')
             try:
                 page.wait_for_selector('[data-controller="broneering"]', timeout=8000)
-                wait_settle(page, 0.3)
+                time.sleep(0.3)  # see note above - wait_settle() would re-pay the full networkidle cost
             except PlaywrightTimeout:
                 log_line("Calendar page didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
                 wait_settle(page, 3)

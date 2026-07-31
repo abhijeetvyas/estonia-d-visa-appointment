@@ -152,13 +152,13 @@ RUNTIME_SIGNATURE = f"\n\n— Sent from {os.environ.get('RUNTIME_LABEL', 'GCP')}
 # you've missed the first couple. Telegram still fires every check,
 # uncapped. Calls are spaced out and capped per "episode": up to
 # MAX_CALLS_PER_ESCALATION calls, each at least CALL_COOLDOWN_SECONDS apart
-# (so 3 calls across a 15-minute span at 5-minute spacing). Once that cap is
+# (so 3 calls across a 6-minute span at 2-minute spacing). Once that cap is
 # hit, calling pauses for CALL_ESCALATION_COOLDOWN_SECONDS before a fresh
 # cycle of up to 3 more calls can start (still only if the slot is available
 # again by then).
-CALL_COOLDOWN_SECONDS = 5 * 60
+CALL_COOLDOWN_SECONDS = 2 * 60
 MAX_CALLS_PER_ESCALATION = 3
-CALL_ESCALATION_COOLDOWN_SECONDS = 6 * 60 * 60
+CALL_ESCALATION_COOLDOWN_SECONDS = 5 * 60
 
 
 def trigger_phone_calls(bypass_cooldown=False):

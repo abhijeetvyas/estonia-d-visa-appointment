@@ -128,6 +128,18 @@ fallback (if you see this regularly, the 8s window may need lengthening for that
 idea applies to the fixed 2s pre-second-CAPTCHA sleep, now a 2s-ceiling wait for the reCAPTCHA
 widget to exist rather than an unconditional 2s pause.
 
+**Correction (initial version of this change had a bug):** the success path originally called
+`wait_settle(page, 0.3)` after `wait_for_selector` succeeded, intending a short trailing pause.
+`wait_settle()` unconditionally does a full `networkidle` wait (up to 15s) internally before its
+own sleep argument even applies - so this was silently re-paying the exact cost the optimization
+was meant to remove, on every single run, regardless of the number passed in. Confirmed directly
+in a dry-run log: a 16s gap between the captcha1-injected and applicant-page screenshots with no
+fallback-timeout line logged, meaning `wait_for_selector` succeeded quickly but `wait_settle()`
+then spent up to 15s waiting for network idle anyway - this site's Turbo/websocket traffic rarely
+goes fully idle, so that wait routinely ran to its full timeout. Fixed: the success path now uses
+a plain `time.sleep(0.3)` instead, since `wait_for_selector` having already succeeded is
+confirmation enough that the target element is there.
+
 ### Alert when a date is available but no time slot could be secured
 
 Previously, if `no_time_slots` occurred (a date showed as available but every retry came back
