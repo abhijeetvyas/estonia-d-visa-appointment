@@ -687,7 +687,19 @@ def run_booker() -> dict:
 
             # Turbo submit to load service dropdown
             page.evaluate("() => document.querySelector('button[name=\"turbo\"]').click()")
-            wait_settle(page, 2.5)
+            # Wait for the actual next element instead of a flat settle delay -
+            # proceeds the instant it's ready; if it doesn't show up within 8s,
+            # falls back to the original (slower but proven) settle wait rather
+            # than failing outright, so this can only be faster, never worse.
+            try:
+                page.wait_for_selector(
+                    'select[name="broneering[toiming]"], select#broneering_toiming',
+                    timeout=8000,
+                )
+                wait_settle(page, 0.3)
+            except PlaywrightTimeout:
+                log_line("Service dropdown didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
+                wait_settle(page, 2.5)
             screenshot(page, "03_after_turbo")
 
             # Service dropdown
@@ -718,7 +730,15 @@ def run_booker() -> dict:
             screenshot(page, "05_captcha1_injected")
 
             page.click('button[name="edasi"]')
-            wait_settle(page, 3)
+            try:
+                page.wait_for_selector(
+                    'input[name="broneering[broneeringuIsikud][0][eesnimi]"]',
+                    timeout=8000,
+                )
+                wait_settle(page, 0.3)
+            except PlaywrightTimeout:
+                log_line("Applicant form didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
+                wait_settle(page, 3)
             screenshot(page, "06_applicant_page")
 
             # ----- Applicant form -----
@@ -736,7 +756,12 @@ def run_booker() -> dict:
             screenshot(page, "07_applicant_filled")
 
             page.click('button[name="edasi"]')
-            wait_settle(page, 3)
+            try:
+                page.wait_for_selector('[data-controller="broneering"]', timeout=8000)
+                wait_settle(page, 0.3)
+            except PlaywrightTimeout:
+                log_line("Calendar page didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
+                wait_settle(page, 3)
             screenshot(page, "08_calendar_page")
 
             if DRY_RUN:
@@ -824,71 +849,107 @@ def run_booker() -> dict:
             # Fall back to clicking the day-of-month cell directly (locale
             # independent, unlike aria-label) if the flatpickr instance isn't
             # reachable for any reason.
-            used_flatpickr_api = page.evaluate(
-                """(dateStr) => {
-                    const input = document.querySelector('input[name="broneering[kuupaev]"]');
-                    if (input && input._flatpickr) {
-                        input._flatpickr.setDate(dateStr, true);
-                        return true;
-                    }
-                    return false;
-                }""",
-                selected_date,
-            )
-            if not used_flatpickr_api:
-                log_line("flatpickr instance not found on date input - falling back to manual day click", file=sys.stderr)
-                day_num = datetime.strptime(selected_date, "%Y-%m-%d").day
-                clicked = page.evaluate(
-                    """(dayNum) => {
-                        const days = document.querySelectorAll('.flatpickr-day');
-                        for (const day of days) {
-                            if (day.classList.contains('prevMonthDay') || day.classList.contains('nextMonthDay')) continue;
-                            if (day.classList.contains('flatpickr-disabled')) continue;
-                            if (parseInt(day.textContent.trim(), 10) === dayNum) {
-                                day.click();
-                                return true;
-                            }
+            # ----- Select the day and read its time slots, with retries -----
+            # A single empty slot-read right after date-selection isn't
+            # necessarily final: the calendar's "available dates" list can
+            # show a date as having capacity while the actual per-slot query
+            # returns zero open times moments later (another applicant grabs
+            # the last one, or a temporary hold expires and frees one back
+            # up). Each retry re-selects the date to trigger a fresh
+            # server-side query rather than just re-reading a DOM that
+            # already returned its one answer - a plain re-check without
+            # re-triggering the request would just see the same empty result.
+            MAX_SLOT_ATTEMPTS = 3
+            SLOT_RETRY_DELAY_SECONDS = 3.0
+            slots: list[dict] = []
+            clean_times: list[str] = []
+            for attempt in range(1, MAX_SLOT_ATTEMPTS + 1):
+                used_flatpickr_api = page.evaluate(
+                    """(dateStr) => {
+                        const input = document.querySelector('input[name="broneering[kuupaev]"]');
+                        if (input && input._flatpickr) {
+                            input._flatpickr.setDate(dateStr, true);
+                            return true;
                         }
                         return false;
                     }""",
-                    day_num,
+                    selected_date,
                 )
-                if not clicked:
-                    log_line(f"WARNING: could not find a clickable flatpickr day for {selected_date}", file=sys.stderr)
-            time.sleep(1)
+                if not used_flatpickr_api:
+                    if attempt == 1:
+                        log_line("flatpickr instance not found on date input - falling back to manual day click", file=sys.stderr)
+                    day_num = datetime.strptime(selected_date, "%Y-%m-%d").day
+                    clicked = page.evaluate(
+                        """(dayNum) => {
+                            const days = document.querySelectorAll('.flatpickr-day');
+                            for (const day of days) {
+                                if (day.classList.contains('prevMonthDay') || day.classList.contains('nextMonthDay')) continue;
+                                if (day.classList.contains('flatpickr-disabled')) continue;
+                                if (parseInt(day.textContent.trim(), 10) === dayNum) {
+                                    day.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""",
+                        day_num,
+                    )
+                    if not clicked and attempt == 1:
+                        log_line(f"WARNING: could not find a clickable flatpickr day for {selected_date}", file=sys.stderr)
+                time.sleep(1)
 
-            # Wait for time slots to load asynchronously after date selection
-            try:
-                page.wait_for_selector('input[type="checkbox"][name="broneering[vastuvotud][]"]', timeout=10000)
-            except PlaywrightTimeout:
-                log_line("Timeout waiting for time slot checkboxes to render", file=sys.stderr)
-            
-            wait_settle(page, 2)
+                # Wait for time slots to load asynchronously after date selection.
+                # wait_for_selector polls internally and returns as soon as the
+                # element appears - it does NOT block for the full timeout on
+                # success. Observed renders take 1-4s, so 5s (comfortable
+                # margin, not a guess) is used on every attempt; this just
+                # caps how long a genuine non-render is tolerated before
+                # moving to the next retry.
+                select_timeout_ms = 5000
+                try:
+                    page.wait_for_selector(
+                        'input[type="checkbox"][name="broneering[vastuvotud][]"]',
+                        timeout=select_timeout_ms,
+                    )
+                except PlaywrightTimeout:
+                    log_line(
+                        f"Timeout waiting for time slot checkboxes to render (attempt {attempt}/{MAX_SLOT_ATTEMPTS})",
+                        file=sys.stderr,
+                    )
+
+                wait_settle(page, 2)
+
+                # ----- Collect time slots for the chosen date -----
+                # The site's checkbox `value` attribute is an internal slot ID
+                # (e.g. "2249050"), NOT the displayed time - the real HH:MM text
+                # lives in a separate <label for="checkbox-id">HH:MM</label>
+                # element. Pair each checkbox with its label via the for/id
+                # relationship (the only reliable link - not DOM proximity, and
+                # not a page-wide scan of every label/span/div, which is both
+                # fragile and can pick up unrelated HH:MM-shaped text elsewhere
+                # on the page) so we can select the exact checkbox by its real
+                # slot ID afterward instead of fuzzy string matching.
+                slots = page.evaluate(
+                    """() => {
+                        const out = [];
+                        document.querySelectorAll('input[name="broneering[vastuvotud][]"]').forEach(cb => {
+                            const lab = cb.id ? document.querySelector(`label[for="${cb.id}"]`) : null;
+                            const time = lab ? lab.textContent.trim() : '';
+                            out.push({ value: cb.value, time });
+                        });
+                        return out;
+                    }"""
+                )
+                clean_times = [s["time"] for s in slots if re.match(r"^\d{1,2}:\d{2}$", s.get("time", ""))]
+                log_line(f"Time slots for {selected_date} (attempt {attempt}/{MAX_SLOT_ATTEMPTS}): {clean_times}")
+
+                if slots:
+                    break
+                if attempt < MAX_SLOT_ATTEMPTS:
+                    log_line(f"No time slots yet for {selected_date} - retrying in {SLOT_RETRY_DELAY_SECONDS}s")
+                    time.sleep(SLOT_RETRY_DELAY_SECONDS)
+
             screenshot(page, "09_date_selected")
-
-            # ----- Collect time slots for the chosen date -----
-            # The site's checkbox `value` attribute is an internal slot ID
-            # (e.g. "2249050"), NOT the displayed time - the real HH:MM text
-            # lives in a separate <label for="checkbox-id">HH:MM</label>
-            # element. Pair each checkbox with its label via the for/id
-            # relationship (the only reliable link - not DOM proximity, and
-            # not a page-wide scan of every label/span/div, which is both
-            # fragile and can pick up unrelated HH:MM-shaped text elsewhere
-            # on the page) so we can select the exact checkbox by its real
-            # slot ID afterward instead of fuzzy string matching.
-            slots = page.evaluate(
-                """() => {
-                    const out = [];
-                    document.querySelectorAll('input[name="broneering[vastuvotud][]"]').forEach(cb => {
-                        const lab = cb.id ? document.querySelector(`label[for="${cb.id}"]`) : null;
-                        const time = lab ? lab.textContent.trim() : '';
-                        out.push({ value: cb.value, time });
-                    });
-                    return out;
-                }"""
-            )
-            clean_times = [s["time"] for s in slots if re.match(r"^\d{1,2}:\d{2}$", s.get("time", ""))]
-            log_line(f"Time slots for {selected_date}: {clean_times}")
 
             selected_time = choose_time(clean_times)
             if not selected_time:
@@ -910,6 +971,18 @@ def run_booker() -> dict:
                 else:
                     result["status"] = "no_time_slots"
                     result["message"] = f"No time slots found for {selected_date}"
+                    log_line(result["message"], file=sys.stderr)
+                    try:
+                        send_telegram(
+                            f"❌ Slot detected but NOT booked – Estonia D-visa, {EMBASSY_NAME}\n\n"
+                            f"Date {selected_date} showed as available, but no bookable time slot "
+                            f"was found after {MAX_SLOT_ATTEMPTS} attempts (likely taken by another "
+                            f"applicant, or a temporary hold, before this run could secure it).\n"
+                            f"Check the portal manually - another date/time may still be open."
+                            f"{RUNTIME_SIGNATURE}"
+                        )
+                    except Exception as e:
+                        log_line(f"no_time_slots Telegram failed: {e}", file=sys.stderr)
                     return result
             else:
                 # Select the checkbox whose label matched selected_time, by its
@@ -940,7 +1013,13 @@ def run_booker() -> dict:
             screenshot(page, "11_spec_filled")
 
             # ----- Second reCAPTCHA -----
-            time.sleep(2)  # give async reCAPTCHA a moment
+            # Wait for the widget to actually exist instead of a flat 2s sleep -
+            # same 2s ceiling as before (never worse), but proceeds the instant
+            # it's ready rather than always waiting the full 2s.
+            try:
+                page.wait_for_selector(".g-recaptcha", timeout=2000)
+            except PlaywrightTimeout:
+                pass
             sitekey2, token2 = get_recaptcha_token(page, RECAPTCHA_SITEKEY, prefetch2_thread, prefetch2_result)
             inject_recaptcha(page, token2)
             time.sleep(1)

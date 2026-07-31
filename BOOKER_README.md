@@ -114,6 +114,43 @@ back to solving fresh exactly like before - correctness never depends on the pre
 only speed does. Look for `Using prefetched reCAPTCHA token (solved in background)` in the logs
 to confirm it's actually kicking in.
 
+### Event-driven waits instead of flat sleeps between form steps
+
+Several steps between page transitions (embassy submit → service dropdown, applicant form
+submit → calendar page, etc.) previously used a flat `wait_settle()` sleep (2.5-3s each,
+regardless of how long the page actually took) as a safety margin. These now wait directly for
+the next step's actual element to appear (`page.wait_for_selector(..., timeout=8000)`) and
+proceed the instant it's there - typically far faster than the old fixed buffer. If the element
+doesn't show up within that window, it falls back to the original flat-sleep behavior exactly as
+before, so this can only be faster, never worse or less reliable. Look for `didn't appear within
+8s - falling back to full settle wait` in `booker.log` to see if a given run ever needed the
+fallback (if you see this regularly, the 8s window may need lengthening for that step). The same
+idea applies to the fixed 2s pre-second-CAPTCHA sleep, now a 2s-ceiling wait for the reCAPTCHA
+widget to exist rather than an unconditional 2s pause.
+
+### Alert when a date is available but no time slot could be secured
+
+Previously, if `no_time_slots` occurred (a date showed as available but every retry came back
+with zero bookable checkboxes - see below), this only showed up in `booker.log`, with no
+Telegram alert. Now a dedicated ❌ Telegram message is sent in this case, since the Stage-2
+"available dates" message doesn't communicate that the actual booking attempt subsequently
+failed - you'd otherwise have no way to know from Telegram alone that a real opportunity was
+seen and lost.
+
+### Time-slot retry on a date that comes up empty
+
+After selecting a date, the booker waits for that date's time-slot checkboxes to render before
+reading them. This can legitimately come back empty even though the calendar listed the date as
+available - the calendar's "available dates" list can be a step ahead of the actual per-slot
+inventory (another applicant takes the last slot, or a temporary hold expires and frees one back
+up, in the seconds between the two checks). The booker now retries up to 3 times: each retry
+re-selects the date (re-triggering a fresh server-side query, not just re-reading the same DOM)
+and waits again before giving up and reporting `no_time_slots`. Each attempt waits up to 5s for
+the checkboxes to render (observed real renders take 1-4s, so this is margin, not a fixed
+sleep - `wait_for_selector` returns the instant the element appears rather than blocking for the
+full timeout), with a 3s pause between attempts. Look for `Time slots for <date> (attempt N/3):
+[...]` in `booker.log` to see how many attempts a given run actually took.
+
 ### Point cron at the hook (instead of the original monitor)
 
 Edit `run_monitor.sh` so the final Python line becomes:
