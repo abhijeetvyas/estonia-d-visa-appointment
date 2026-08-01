@@ -11,6 +11,22 @@ from bs4 import BeautifulSoup
 URL = 'https://broneering.mfa.ee/en/'
 TARGET = 'Long-stay visa (D-visa) application'
 
+# Global session for connection pooling (added new code by Digvijay)
+_session = None  
+def get_session(): 
+    """Reuse session with connection pooling..."""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=2,
+            pool_maxsize=2,
+            max_retries=0, 
+        ) 
+        _session.mount('https://', adapter)
+        _session.mount('http://', adapter)
+        return _session
+
 
 def log_line(msg, file=sys.stdout):
     """Prints with an ISO timestamp prefix so log entries can be correlated
@@ -52,15 +68,16 @@ FAILURE_ALERT_COOLDOWN_SECONDS = int(1.5 * 60 * 60)  # re-alert on an ongoing fa
 
 
 def check_availability():
-    s = requests.Session()
+    #s = requests.Session()
+    s = get_session()
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Accept': 'text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8',
     }
-    r = s.get(URL, headers=headers, timeout=30)
+    r = s.get(URL, headers=headers, timeout=10)
     r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, 'html.parser')
+    soup = BeautifulSoup(r.text, 'lxml')
     token_inp = soup.find('input', {'name': 'broneering[_token]'})
     if not token_inp:
         raise RuntimeError('CSRF token not found on landing page — site markup may have changed')
@@ -85,10 +102,10 @@ def check_availability():
         'broneering[_token]': token,
         'turbo': '',
     }
-    r2 = s.post(action, headers=post_headers, data=data, timeout=30)
+    r2 = s.post(action, headers=post_headers, data=data, timeout=10)
     r2.raise_for_status()
 
-    soup2 = BeautifulSoup(r2.text, 'html.parser')
+    soup2 = BeautifulSoup(r2.text, 'lxml')
     sel = soup2.find('select', {'name': 'broneering[toiming]'}) or soup2.find('select', {'id': 'broneering_toiming'})
     if not sel:
         raise RuntimeError('Service dropdown not found in step-2 response — site markup may have changed')
@@ -122,14 +139,15 @@ def _telegram_creds():
 
 def send_telegram_text(message):
     token, chat_ids = _telegram_creds()
+    s = get_session()
     errors = []
     sent_count = 0
     for chat_id in chat_ids:
         try:
-            resp = requests.post(
+            resp = s.post(
                 f'https://api.telegram.org/bot{token}/sendMessage',
                 data={'chat_id': chat_id, 'text': message},
-                timeout=30,
+                timeout=10,
             )
             resp.raise_for_status()
             sent_count += 1
@@ -212,14 +230,15 @@ def trigger_phone_calls(bypass_cooldown=False):
         save_state(state)
 
     to_numbers = [n.strip() for n in to_numbers_raw.split(',') if n.strip()]
+    s = get_session()
     errors = []
     for to_number in to_numbers:
         try:
-            resp = requests.post(
+            resp = s.post(
                 f'https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls.json',
                 auth=(account_sid, auth_token),
                 data={'To': to_number, 'From': from_number, 'Url': twiml_url},
-                timeout=30,
+                timeout=10,
             )
             resp.raise_for_status()
         except Exception as e:
@@ -342,11 +361,24 @@ def main():
     try:
         # One retry for transient network/session blips before treating this
         # as a real failure worth alerting on.
-        try:
+       '''try:
             found, available = check_availability()
         except Exception as e:
             log_line(f'First attempt failed ({e}), retrying once...', file=sys.stderr)
             found, available = check_availability()
+            '''
+        max_attempts = 2
+        for attempt in range(max_attempts): 
+            try: 
+                found, available = check_availability()
+                break
+            except Exception as e:
+                 if attempt == max_attempts - 1:
+                     raise
+                 log_line(f'Attempt {attempt + 1} failed...')
+                 time.sleep(0.5) 
+
+    
     except Exception as exc:
         handle_failure(exc)
         sys.exit(1)  # mark the GitHub Actions run as failed too
