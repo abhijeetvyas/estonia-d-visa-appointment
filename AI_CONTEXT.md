@@ -415,3 +415,193 @@ deliberate, informed choice (not an oversight) made when weighing redundancy aga
 if this behavior is ever revisited, that trade-off was made knowingly, not missed.
 `RUNTIME_LABEL` (section 5) exists specifically so alerts are distinguishable by source machine
 when running this way.
+
+## 9. Aug 2026 session: digvijayv regression fix + real production log analysis (read this before touching monitor.py, the workflow YAML, or trying to speed up detection frequency)
+
+This section documents a single analysis/debugging session by an AI agent (Claude, via Cowork)
+on 2026-08-02, covering three things a future agent (including a fresh Claude/Opus/Fable session
+picking this up) needs to know before re-doing any of this work: (1) a set of real bugs found and
+fixed on `gcp-booker`, (2) real measured production data (not estimates) on execution time and
+polling frequency, and (3) what is already optimized in the booker so effort isn't wasted
+re-suggesting it. **As of this writing, the fix in (1) exists only as a local commit on the
+machine that has this repo synced — it has NOT been pushed to `origin/gcp-booker` and has NOT
+been pulled onto the GCP VM.** See "Deploy status" at the end of this section before assuming
+either the fix or the VM's current running code is in any particular state.
+
+### 9.1 Bugs found in commits `615bbb0`, `ff476e7`, `d108749` (all by `digvijayv`, all on `gcp-booker` only — `main` and `gcp-setup` never had these commits, confirmed via `git merge-base --is-ancestor`, so those two branches needed no fix)
+
+These three commits (adding `lxml`, switching the monitor to session-reuse + `lxml` parsing +
+a retry loop, and adding pip caching to the GitHub Actions workflow) were well-intentioned but
+left the branch in a state that does not even compile. Confirmed directly (not assumed) via
+`python3 -c "import py_compile; py_compile.compile('estonia_visa_monitor.py', doraise=True)"` and
+`python3 -c "import yaml; yaml.safe_load(open('.github/workflows/estonia-visa-monitor.yml'))"` —
+both failed before the fix, both pass after. Four fixes were applied, all in
+`estonia_visa_monitor.py` and `.github/workflows/estonia-visa-monitor.yml`, committed together as
+`5dc496b` on `gcp-booker`:
+
+1. **`.github/workflows/estonia-visa-monitor.yml`**: `cache:'pip'` (missing space after the
+   colon) is invalid YAML — a mapping key needs `cache: 'pip'`. Confirmed via PyYAML raising
+   `could not find expected ':'`. This only affects the GitHub Actions fallback path (section 1),
+   not the live VM, but would break that workflow entirely if it were ever exercised (e.g. via
+   `TEST_TELEGRAM` workflow_dispatch or if the VM cron ever goes down and this is used as a
+   backup). Fixed: added the space.
+2. **`get_session()` in `estonia_visa_monitor.py`**: the `return _session` line was indented
+   *inside* the `if _session is None:` block, not after it. This means the very first call in a
+   process creates and returns a session correctly, but every subsequent call to `get_session()`
+   in the same process — e.g. `send_telegram_text()` or `trigger_phone_calls()` calling it after
+   `check_availability()` already created one — falls through and returns `None` implicitly.
+   Confirmed by executing the exact function body directly: first call returned the real session
+   object, second call returned `None`. This would have crashed with
+   `AttributeError: 'NoneType' object has no attribute 'post'` at the exact moment a real
+   AVAILABLE alert tries to fire — the single worst place for a silent regression in this whole
+   system, since it would look like "the monitor is fine" (the check itself doesn't call
+   `get_session()` twice) right up until a real slot is found and the alert path crashes instead
+   of sending. **Important: this bug has never actually fired in the observed production logs**
+   (see 9.2 — the 5 real slot-detection events on record all predate this commit and ran under
+   whatever code was live before `gcp-booker`'s tip moved to `d108749`), so there is no evidence
+   of an alert having been silently lost to this specific bug yet — but it would be live-breaking
+   the next time a real slot is found, if this fix is not deployed first. Fixed: moved
+   `return _session` outside the `if` block (unconditional return).
+3. **Dead code in `main()`**: the old single-retry logic was "commented out" by wrapping it in a
+   `'''...'''` string, but the closing `'''` was on its own line at a different indentation level
+   than the opening one, which broke Python's block structure entirely (`IndentationError:
+   unexpected indent` at the `max_attempts = 2` line, confirmed via `py_compile`). This is not a
+   logic bug, it's a leftover editing artifact — likely from an editor auto-indent or a manual
+   half-finished comment-out. Fixed: deleted the dead block entirely, kept only the new
+   `for attempt in range(max_attempts)` retry loop that was clearly the intended replacement.
+4. **Timeouts dropped from 30s to 10s** on all four outbound calls (site GET, site POST, Telegram
+   send, Twilio call) in the same commit. Given this entire project's documented history (sections
+   2.4-2.6) is about fighting slow/flaky connections to this specific site, a tighter timeout
+   means a higher rate of false `MONITOR FAILURE` alerts under ordinary site slowness — actively
+   working against reliability effort already invested, for no stated benefit (the commit message
+   doesn't mention a timeout-related problem being solved). Fixed: reverted all four back to 30s.
+   If someone deliberately wants tighter timeouts later, do it as its own explicit, justified
+   change, not bundled silently into an unrelated session-reuse commit.
+
+The `lxml` switch and the general idea of a retry loop and session reuse were kept — those are
+genuinely good changes, only the execution had bugs. Don't re-revert those parts.
+
+### 9.2 Real production measurements taken on the VM (2026-08-02, `abhijeetvyas13@estonia-visa-monitor`) — use these, not estimates from reading the code
+
+The plain monitor's execution time was estimated from code-reading earlier in this same session
+(sub-1-2s guess) and then *actually measured* directly on the VM via `time ./run_monitor.sh`,
+run 5 times back to back:
+
+```
+real 0m0.972s / 0m1.011s / 0m1.021s / 0m1.082s / 0m0.978s
+```
+
+So: **~1 second flat per check**, consistently, against the 30s timeout ceiling (now correctly
+restored per 9.1.4) and the 10s polling interval. This confirms the check itself uses roughly
+10% of its available time budget per tick, with wide headroom before the interval itself becomes
+the constraint.
+
+Polling frequency was confirmed as genuinely sustained at ~10s, not just configured that way:
+`awk '{print $1}' monitor.log | tail -500` showed timestamps landing in ~10s steps
+(`02:05:42, 52, 02:06:02, 12, 22, 32, 42, 52...`) with only minor ±1-2s jitter, `grep CRON
+/var/log/syslog | tail -30` confirmed cron itself firing exactly 6 times per 60s as configured,
+and critically, **`tail -500 monitor.log | grep -c SKIPPED` returned `0`** — zero overlapping-run
+skips in the last 500 log lines. This means the 10s cadence is currently fully sustained with no
+contention at all (consistent with the ~1s execution time measured above), not degraded or
+silently running slower than configured.
+
+**The actual bottleneck, confirmed via `booker.log`, is not detection frequency — it's the
+booker's own execution time relative to the real-world race window.** Every real trigger event on
+record (`grep -E 'Booker starting|Booker finished' booker.log`) resulted in `no_time_slots` — the
+monitor correctly detected an available date every time, but by the time the booker reached the
+calendar, selected the date, and exhausted its 3 retries waiting for a bookable checkbox to
+render, nothing was left:
+
+| Run (2026-07-31) | Start → End | Duration |
+|---|---|---|
+| 1 | 05:57:24 → 05:58:09 | 45s |
+| 2 | 06:04:24 → 06:05:00 | 36s |
+| 3 | 06:30:43 → 06:31:30 | 47s |
+| 4 | 06:35:33 → 06:37:13 | 100s |
+| 5 | 06:40:33 → 06:41:46 | 73s |
+
+Every single one of these is longer — some 2-3x longer — than the ~30-second real-world race
+window documented in section 2.14 (how fast another applicant took a slot after it first appeared,
+observed once). **These 5 events predate `gcp-booker`'s tip moving to the digvijayv commits** (they
+ran under whichever code was live on the VM before `d108749`/`ff476e7`/`615bbb0` existed), so they
+are not evidence of the bugs in 9.1 causing this — they reflect the booker's inherent speed against
+this specific race, independent of that regression.
+
+**Conclusion, stated explicitly so a future agent doesn't have to re-derive it**: detection is not
+the constraint. It runs in ~1s against a 10s interval with zero skip contention, i.e. there is
+technically slack to poll tighter than 10s without breaking anything mechanically — but doing so
+would not move the needle on the actual observed failure mode, which is that the booker takes
+36-100s to even attempt securing a slot, well past the ~30s window competitors appear to be filling
+it in. **Do not spend effort tightening the cron interval below 10s as a fix for lost bookings —
+the evidence points entirely at booker-side speed (or a stale-availability-list issue, see below)
+as the lever that matters.** Tightening polling further also has real downside: cron's granularity
+is fixed at 1 minute so going tighter means more staggered lines, actual check runtime would start
+approaching the interval at some point (though currently far from it), and more frequent requests
+against a government portal risks inviting stricter anti-automation measures (a CAPTCHA already
+appeared at the service-selection step per section 2.14).
+
+**Open question worth investigating, not yet root-caused**: why has `no_time_slots` happened on
+100% of recorded real trigger events (5/5)? Two different, non-exclusive hypotheses, neither
+confirmed: (a) the booker genuinely is too slow end-to-end (36-100s) and slots really are gone by
+the time it checks, or (b) the calendar's "available dates" list (`vastuvotukuupaevad` attribute,
+see `run_booker()`'s calendar-extraction code) is itself stale/optimistic — i.e. it may list a date
+as having capacity based on stale server-side state even when the actual per-slot inventory for
+that date is already empty, independent of how fast the booker runs. The existing 3-attempt retry
+loop with re-selection (added specifically to handle exactly this "date says available, slots come
+back empty" case, see section 8's "Time-slot retry" note in `BOOKER_README.md`) already assumes
+hypothesis (b) is at least partially true, but 5/5 failures despite that retry loop suggests either
+the retry window (3 attempts, 3s apart, ~9-15s total) still isn't enough, or something more
+structural is going on. A future agent picking this up should treat this as the highest-leverage
+open question, not booker-vs-monitor speed tuning in isolation.
+
+### 9.3 Already optimized in the booker — do not re-suggest these as if they're gaps
+
+For a future agent asked to "improve" booking speed/success rate: the following are already
+implemented and reasoned through in this codebase (with the specific reasoning already documented
+in `AI_CONTEXT.md` section 8 and `BOOKER_README.md`) — re-proposing any of these from scratch
+wastes a turn:
+
+- Background CAPTCHA prefetching for both reCAPTCHAs, started at the very beginning of
+  `run_booker()`, before the browser even launches (section 8, "Background CAPTCHA prefetching").
+- `CAPTCHA_PROVIDER=race` mode — fires CapSolver and 2captcha concurrently, keeps whichever
+  finishes first (section 8, `_race_solve_recaptcha`). Currently the default in
+  `run_booker_dryrun.sh` and mentioned as available in `BOOKER_README.md`, but check
+  `run_monitor.sh` on the VM for what's actually set live (it currently sets
+  `CAPTCHA_PROVIDER=race` per the crontab dump taken this session).
+- Persistent warm Chromium via CDP (`persistent_chromium.py` + systemd service) to skip the
+  10-30s+ cold-launch cost — falls back to fresh launch automatically if unreachable.
+- Event-driven waits (`page.wait_for_selector(...)`) replacing flat sleeps between form-transition
+  steps, with a documented, already-fixed bug (the `wait_settle(page, 0.3)` re-paying a full
+  networkidle wait — see section 8, "Correction (initial version of this change had a bug)").
+- The 3-attempt time-slot retry loop with date re-selection (not just re-reading the same DOM) —
+  see 9.2's open question above for why this may still not be sufficient.
+- Real Chrome / persistent-profile experiment (`BROWSER_CHANNEL`, `BROWSER_USER_DATA_DIR`) to test
+  whether a real browser on a real IP gets easier CAPTCHA challenges — explicitly still an
+  unconfirmed hypothesis, not a shipped fix, opt-in and off by default on the VM.
+
+If asked to improve this further, the two directions with actual evidence behind them (per 9.2)
+are: (a) root-causing why `no_time_slots` is 5/5 so far — possibly by logging/inspecting the raw
+`vastuvotukuupaevad` calendar attribute's timing relative to the actual per-slot query, not just
+retrying blindly — or (b) reducing the booker's own critical-path time below the ~30s observed
+race window, which at a current best case of 36s is not yet consistently achieved even once.
+
+### Deploy status as of this writing (2026-08-02) — read before pushing or pulling anything
+
+- Fix commit `5dc496b` (section 9.1) exists **only** in the local git checkout on the machine
+  syncing this folder. It has **not** been pushed to `origin/gcp-booker` on GitHub, and the GCP VM
+  has **not** pulled it — confirmed the VM's `run_monitor.sh` executes successfully right now
+  (5 clean `time ./run_monitor.sh` runs, no `IndentationError`), meaning the VM's current
+  checkout predates `digvijayv`'s three broken commits and is unaffected by any of this.
+  **Do not `git pull` on the VM before pushing the fix to origin first** — pulling now would pull
+  whatever is currently on `origin/gcp-booker`, which (unless already pushed) is still the broken
+  state from 9.1.
+- Recommendation made to the human at the end of this session: **hold off on pushing/deploying
+  this fix to the VM until the follow-up work on the open question in 9.2 is also done** (a
+  separate thread/session was planned to investigate booker speed / the `no_time_slots` root
+  cause). Reasoning: that follow-up will likely touch the same files (`estonia_d_visa_booker.py`
+  at minimum), so doing one combined push + VM pull + `DRY_RUN=1` verification pass once both sets
+  of changes exist avoids a two-step deploy and reduces the chance of the VM sitting on a
+  half-fixed intermediate state. When it is time to deploy: push to `origin/gcp-booker`, `git
+  pull` on the VM, then verify with `DRY_RUN=1 ./run_booker_dryrun.sh` (or equivalent manual env
+  vars) before trusting it live in cron — do not skip straight to relying on the next real
+  slot-detection event as the first real test of a fix.
