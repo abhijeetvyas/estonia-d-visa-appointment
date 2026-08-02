@@ -423,6 +423,241 @@ rm -f .state/booker_state_40.json
 # or edit the file and set "booked": false
 ```
 
+## Parked-Session Booker Daemon (`estonia_booker_daemon.py`)
+
+Implements `SPEC - Parked Session Booker Daemon.md` in full - read that file
+for the design rationale (why sessions can be "parked" for ~20 minutes and
+polled for free once past the CAPTCHA gate) and `IMPLEMENTATION_CHANGELOG.md`
+for exactly which requirement (R1-R42) is satisfied where. This section is
+just the operational reference.
+
+**This is a separate process from both the plain monitor and the old
+Playwright booker above.** It does not replace either - `estonia_d_visa_booker.py`
+stays in place as a fallback (disable it by leaving `ENABLE_BOOKER` unset),
+and `estonia_visa_monitor.py` is never modified by any of this (R1). If the
+daemon is not running, or crashes, detection and alerting behave exactly as
+before (R4).
+
+### What it does, in one paragraph
+
+The monitor hook (`estonia_visa_monitor_booker_hook.py`) now also writes
+`.state/trigger_<EMBASSY_ID>.json` on every detection (R5-R6), independent of
+`ENABLE_BOOKER`. The daemon polls that file every 0.5s (R7); on a fresh
+trigger, if it doesn't already have a live "seat" (a parked, authenticated
+session sitting on the calendar page), it solves a CAPTCHA and acquires one.
+From then on it polls real time-slot inventory every 2s for free (no
+CAPTCHA), and the instant a slot appears, submits a booking immediately using
+a pre-solved token from its background reserve - typically ~1 second from
+slot appearing to submit, versus the old booker's ~20-25s.
+
+### New files this adds
+
+| File | Purpose |
+|---|---|
+| `estonia_booking_http.py` | Reusable, browserless HTTP flow (establish_seat, query_free_times, submit_booking, delete_booking) - extracted from `probe_http_flow.py`/`test_session_longevity.py`. No daemon logic of its own. |
+| `estonia_booker_daemon.py` | The daemon itself: seat lifecycle, trigger watching, slot polling, CAPTCHA token reserve, booking, logging/CSV/Telegram. |
+| `estonia-booker-daemon.service` | systemd unit (R39). |
+| `estonia-booker-daemon.logrotate` | logrotate config for `daemon.log`/`daemon_polls.csv`, mirrors the monitor's own (R33). |
+| `IMPLEMENTATION_CHANGELOG.md` | Required by the spec (§12) - maps every requirement ID to where it's implemented, what was tested, and open questions. |
+
+### Runtime artifacts (not in git, created on first run)
+
+| Path | Purpose |
+|---|---|
+| `.state/trigger_<EMBASSY_ID>.json` | Written by the hook on every detection; read by the daemon (R5-R7). |
+| `.state/booker_state_<EMBASSY_ID>.json` | The SAME "already booked" flag file used by the old Playwright booker - shared deliberately so neither booker double-books (R24-R25). |
+| `daemon.log` | Timestamped state-transition log (R33-R34). |
+| `daemon_polls.csv` | Every slot poll: `utc, seat_age_s, date, slot_count, slot_times, query_ms, seat_alive` (R35). |
+| `daemon_dumps/` | Full response HTML on any booking failure (R36). |
+| `/tmp/estonia_booker_daemon_<EMBASSY_ID>.lock` | Single-instance lock (R41). |
+
+### Environment variables (R42)
+
+All optional except the credentials; every default matches the spec's §6.9 table.
+
+```bash
+# Target (same convention as the monitor)
+export EMBASSY_ID="40"
+export EMBASSY_NAME="New Delhi"
+
+# Seat lifecycle
+export SEAT_TTL_SECONDS=1440           # measured hard ceiling (F5) - sanity backstop, not the operating number
+export SEAT_RENEW_AFTER_SECONDS=1200   # start overlapping renewal at 20 minutes
+
+# Slot polling / CAPTCHA reserve
+export SLOT_POLL_INTERVAL_SECONDS=2
+export TOKEN_REFRESH_SECONDS=75
+export TOKEN_MAX_AGE_SECONDS=100
+
+# Date-list refresh cadence (round-2 Fix 2). Separate from
+# SLOT_POLL_INTERVAL_SECONDS on purpose - a new date appearing is an
+# episode-scale event (minutes apart, F9), not a sub-second one, so
+# refreshing it on every slot poll just doubled request volume for no
+# benefit.
+export DATE_REFRESH_INTERVAL_SECONDS=10
+
+# Debounce for FORCED date-list refreshes (round-3 Fix 8). A forced refresh
+# happens when a new trigger-file update arrives while a seat is already
+# live, but the monitor writes a fresh trigger on EVERY ~10s detection tick
+# for the whole episode (not once per episode) - refreshing on every single
+# one of those was round 2's actual bug. This caps forced refreshes to at
+# most once per this many seconds no matter how often triggers arrive.
+export FORCED_REFRESH_MIN_INTERVAL_SECONDS=30
+
+# Suspect-seat detection (round-3 Fix 7 - replaces round 2's WRONG "refreshed
+# dates look the same as acquisition time" heuristic, which flagged the
+# NORMAL case - a single date persisting unchanged across an entire episode,
+# per F9/F10 - as suspicious). The real signal: the monitor independently
+# confirms inventory exists (a trigger arrived within
+# TRIGGER_FRESH_WINDOW_SECONDS) while every date this seat can see keeps
+# coming back with zero slots, for SUSPECT_AFTER_EMPTY_POLLS consecutive
+# poll cycles (default 5, ~10s of corroborating evidence at the default 2s
+# poll cadence - not a single unlucky poll). Resets to zero the instant any
+# date returns a non-empty slot list.
+export TRIGGER_FRESH_WINDOW_SECONDS=60
+export SUSPECT_AFTER_EMPTY_POLLS=5
+
+# Hard backstop on reacquisition frequency (round-3 Fix 10). Even once
+# genuinely flagged suspect, reacquisition fires at most once per this many
+# seconds, REGARDLESS of cause (TTL renewal and suspect-driven reacquisition
+# share this cooldown - see begin_overlapping_reacquire()). This bounds the
+# cost of a wrong heuristic to one CAPTCHA every 5 minutes instead of one
+# every 10 seconds. When suppressed, logs REACQUIRE_SUPPRESSED with the
+# remaining cooldown.
+export REACQUIRE_COOLDOWN_SECONDS=300
+
+# Cost/safety guards
+export MAX_SOLVES_PER_HOUR=60
+export CAPSOLVER_LOW_BALANCE_USD=2.00
+
+# Hard outbound rate ceiling (round-2 follow-up Fix 3) - read by
+# estonia_booking_http.py, applies to EVERY request this daemon makes to
+# broneering.mfa.ee, across every call path (seat acquisition/renewal, slot
+# polling, date refresh, booking submit, test-cleanup delete) and both
+# threads that can issue them (main loop + background seat-renewal thread).
+# This is a safety net against runaway traffic from a future bug, not a
+# tuning knob - it BLOCKS until a token is available rather than dropping
+# requests, and logs `RATE_THROTTLED` (at most once every 30s) whenever it
+# has to wait.
+export MAX_REQUESTS_PER_SECOND=1.0
+export REQUEST_BURST_ALLOWANCE=3     # small burst allowance on top of the steady rate above
+
+# Modes (both default OFF/unset)
+export DAEMON_DRY_RUN=1           # do everything except the final submit POST
+export DAEMON_SELF_DETECT=1       # opt-in independent site check every 10s, instead of relying solely on the monitor's trigger file - triples request volume if left on, off by default (R8)
+
+# CAPTCHA provider for on-demand solves (seat acquisition/renewal, and booking
+# when the reserve is empty/stale). The background token RESERVE always uses
+# CapSolver alone regardless of this setting (R30).
+export CAPTCHA_PROVIDER=capsolver   # or 2captcha, or race
+export CAPSOLVER_API_KEY="..."
+export TWOCAPTCHA_API_KEY="..."     # only needed if CAPTCHA_PROVIDER=2captcha or race
+
+# Applicant data (same files as the old booker)
+export APPLICANT_DATA_REAL="/home/abhijeetvyas13/estonia-d-visa-appointment/applicant_data_real.json"
+export APPLICANT_DATA_DUMMY="/home/abhijeetvyas13/estonia-d-visa-appointment/applicant_data_dummy.json"
+
+# Telegram / labelling (same as the monitor/old booker)
+export TELEGRAM_BOT_TOKEN="..."
+export TELEGRAM_CHAT_ID="..."
+export RUNTIME_LABEL="GCP"
+```
+
+### Round-2 follow-up: request-rate fixes and self-healing date refresh
+
+The original daemon fired ~2 requests/second continuously while a seat was
+live (roughly 10x the plain monitor's own rate) because the slot-poll loop
+was never actually throttled to `SLOT_POLL_INTERVAL_SECONDS`, and the R17
+date-list refresh ran on every single poll. Both are now fixed - see
+`IMPLEMENTATION_CHANGELOG.md` §8 for the full before/after arithmetic. In
+short: slot polling and date-list refreshing now run on their own,
+independent cadences (`SLOT_POLL_INTERVAL_SECONDS` / `DATE_REFRESH_INTERVAL_SECONDS`
+above), decoupled from the 0.5s trigger-detection loop (which must stay fast
+per R7), and a global token-bucket rate limiter in `estonia_booking_http.py`
+(`MAX_REQUESTS_PER_SECOND`/`REQUEST_BURST_ALLOWANCE`) sits underneath
+everything as a hard ceiling no future bug can bypass.
+
+Round 2 also shipped a self-healing check whose suspect condition turned out
+to be wrong - see the round-3 section below, which replaces it.
+
+### Round-3 follow-up: fixing the suspect-detection logic itself
+
+Round 2's suspect check ("the refreshed date list looks the same as it did
+at seat acquisition") was backwards: a single date persisting unchanged
+across an entire episode - and even across several episodes - is the NORMAL
+case for this site (F9/F10), not a sign of anything wrong. Combined with the
+monitor writing a fresh trigger-file update on every ~10s detection tick for
+the whole ~90-110s episode (not once per episode), that heuristic declared
+`DATE_REFRESH_SUSPECT` on the very first re-announcement of a still-perfectly-normal
+episode, dropped the live seat, and blocked the main loop on a fresh CAPTCHA
+solve - repeatedly, for the entire episode, without the daemon ever actually
+polling for a slot. See `IMPLEMENTATION_CHANGELOG.md` §9 for the full
+incident and worked-example arithmetic.
+
+Round 3 replaces the whole mechanism:
+
+- **The suspect condition is now based on poll results, not refresh
+  results.** A seat is only suspect when the monitor is independently
+  confirming inventory exists (a trigger seen within
+  `TRIGGER_FRESH_WINDOW_SECONDS`) while every date the seat can see has
+  returned zero slots for `SUSPECT_AFTER_EMPTY_POLLS` consecutive polls.
+- **Forced date-list refreshes are debounced** (`FORCED_REFRESH_MIN_INTERVAL_SECONDS`)
+  so the monitor's every-10s re-announcement of the same episode no longer
+  causes a fresh refresh (or, previously, a fresh reacquisition) every time.
+- **Reacquisition never drops the seat first.** Suspect-driven reacquisition
+  now goes through the exact same overlapping-renewal machinery R11 already
+  used for TTL-based renewal (acquire the replacement in the background,
+  verify it, then swap) - the existing seat keeps serving polls the entire
+  time, instead of round 2's synchronous drop-then-acquire leaving zero
+  coverage for ~15-25s.
+- **A hard cooldown** (`REACQUIRE_COOLDOWN_SECONDS`) caps reacquisition to
+  once per 5 minutes regardless of cause, so even a still-imperfect
+  heuristic costs one CAPTCHA every 5 minutes at worst, not one every 10
+  seconds.
+
+### Running it
+
+```bash
+cd ~/estonia-d-visa-appointment
+source venv/bin/activate  # or invoke venv/bin/python3 directly, per this repo's cron convention
+export EMBASSY_ID=244 EMBASSY_NAME="Abu Dhabi"   # NEVER test against New Delhi (EMBASSY_ID=40) - see spec §9
+export DAEMON_DRY_RUN=1
+export CAPSOLVER_API_KEY=...
+export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
+venv/bin/python3 estonia_booker_daemon.py
+```
+
+To simulate a trigger without waiting for a real detection, write the file
+by hand:
+
+```bash
+python3 -c "import json,time,pathlib; p=pathlib.Path('.state/trigger_244.json'); p.parent.mkdir(exist_ok=True); p.write_text(json.dumps({'ts': time.time(), 'services': ['test']}))"
+```
+
+### systemd unit
+
+```bash
+grep '^export ' run_monitor.sh > run_booker_daemon_env.sh   # extract secrets only, verify it has no invocation lines
+sudo cp estonia-booker-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now estonia-booker-daemon
+sudo systemctl status estonia-booker-daemon
+journalctl -u estonia-booker-daemon -f
+```
+
+### Log rotation
+
+```bash
+sudo cp estonia-booker-daemon.logrotate /etc/logrotate.d/estonia-booker-daemon
+sudo logrotate -f /etc/logrotate.d/estonia-booker-daemon   # force a test rotation
+```
+
+### Clearing the booked flag (shared with the old booker)
+
+```bash
+rm -f .state/booker_state_<EMBASSY_ID>.json
+```
+
 ## Creating / pushing the `gcp-booker` branch (from your laptop or the VM)
 
 ```bash

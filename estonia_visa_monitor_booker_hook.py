@@ -20,9 +20,12 @@ Environment (in addition to the original monitor vars):
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 # Make sure the original monitor is importable from the same directory
@@ -34,6 +37,46 @@ import estonia_visa_monitor as mon  # noqa: E402
 
 BOOKER_SCRIPT = Path(os.environ.get("BOOKER_SCRIPT", SCRIPT_DIR / "estonia_d_visa_booker.py"))
 ENABLE_BOOKER = os.environ.get("ENABLE_BOOKER", "").lower() in ("1", "true", "yes")
+
+# --- Parked-Session Booker Daemon trigger file (spec R5-R7) -----------------
+# This is the ONLY hook the daemon (`estonia_booker_daemon.py`) has into
+# detection. It is intentionally decoupled from ENABLE_BOOKER (the old
+# Playwright-booker switch) and from the daemon actually running at all -
+# the daemon polls this file every 0.5s (R7) and treats a newer timestamp as
+# a fresh trigger; if the daemon isn't running, the file is just written and
+# never read, with zero effect on anything else (R4).
+STATE_DIR = SCRIPT_DIR / ".state"
+
+
+def write_daemon_trigger(available_services: list) -> None:
+    """R5: atomically write .state/trigger_<EMBASSY_ID>.json with
+    {"ts": <unix time>, "services": [...]}. R6: any exception here must be
+    caught and logged WITHOUT affecting the alerting path above this call -
+    a bug in this brand-new, optional trigger mechanism must never be able
+    to take down the one thing (Telegram/Twilio alerting) the owner
+    explicitly requires to always work (spec R1-R4)."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        trigger_path = STATE_DIR / f"trigger_{mon.EMBASSY_ID}.json"
+        payload = {"ts": time.time(), "services": list(available_services)}
+        # Atomic write: temp file in the same directory (so os.replace() is
+        # a same-filesystem rename, not a cross-device copy) then os.replace,
+        # so the daemon's 0.5s poll never sees a half-written file.
+        fd, tmp_path = tempfile.mkstemp(dir=str(STATE_DIR), prefix=".trigger_tmp_")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp_path, trigger_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        mon.log_line(f"Daemon trigger file written: {trigger_path}")
+    except Exception as e:
+        # R6: never let this bubble up into the caller's alerting path.
+        mon.log_line(f"Failed to write daemon trigger file (non-fatal, alerting unaffected): {e}", file=sys.stderr)
 
 
 def trigger_booker() -> None:
@@ -87,6 +130,15 @@ def main() -> None:
     mon.clear_failure_state_if_needed()
 
     if found:
+        # Written FIRST, before the Telegram/Twilio alert: the whole point of
+        # the parked-session daemon (SPEC §1) is cutting detection-to-submit
+        # latency to ~1s, and the daemon polls this file every 0.5s (R7) - a
+        # slow or failing Telegram/Twilio call must not add its own latency
+        # in front of that. write_daemon_trigger() is independently
+        # exception-safe (R6), so this ordering cannot make alerting any less
+        # reliable than before.
+        write_daemon_trigger(available)
+
         mon.send_availability_alert(available)
         mon.log_line(f"AVAILABLE: {mon.TARGET}. Telegram sent. Services: {available}")
 

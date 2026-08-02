@@ -1,0 +1,39 @@
+[Unit]
+Description=Estonia D-Visa Parked-Session Booker Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=abhijeetvyas13
+WorkingDirectory=/home/abhijeetvyas13/estonia-d-visa-appointment
+# R39 requires "the same env vars as run_monitor.sh". run_monitor.sh itself
+# is not reusable as-is here: it ends by synchronously invoking the monitor
+# script, and it is not in git (holds all secrets as `export` lines - see
+# AI_CONTEXT.md §3), so this repo cannot ship a copy of it. Instead, extract
+# just the `export ...` lines from run_monitor.sh on the VM into a sibling
+# file, `run_booker_daemon_env.sh` (same directory, also NOT in git - add it
+# to .gitignore alongside run_monitor.sh), and point EnvironmentFile-style
+# sourcing at that instead:
+#
+#   grep '^export ' run_monitor.sh > run_booker_daemon_env.sh
+#
+# then hand-verify it only contains export lines (no invocation of the
+# monitor itself) before enabling this unit.
+ExecStart=/bin/bash -lc 'source /home/abhijeetvyas13/estonia-d-visa-appointment/run_booker_daemon_env.sh && exec /home/abhijeetvyas13/estonia-d-visa-appointment/venv/bin/python3 /home/abhijeetvyas13/estonia-d-visa-appointment/estonia_booker_daemon.py'
+Restart=always
+RestartSec=10
+# R40: SIGTERM is handled explicitly in estonia_booker_daemon.py (finishes
+# any in-flight booking attempt, logs shutdown, exits 0) - give it real time
+# to do that instead of systemd's default 90s-then-SIGKILL being fine anyway,
+# but also not so long that a genuinely hung process blocks a restart.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# stdout/stderr also go to journald as a second copy of daemon.log (R33) -
+# useful for `journalctl -u estonia-booker-daemon -f` without tailing the
+# file directly.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

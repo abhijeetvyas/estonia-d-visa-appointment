@@ -605,3 +605,163 @@ race window, which at a current best case of 36s is not yet consistently achieve
   pull` on the VM, then verify with `DRY_RUN=1 ./run_booker_dryrun.sh` (or equivalent manual env
   vars) before trusting it live in cron — do not skip straight to relying on the next real
   slot-detection event as the first real test of a fix.
+
+## 10. Aug 2026 session #2 (2026-08-02, later the same day): browserless flow proven end to end, session lifetime measured, root cause revised
+
+This section supersedes parts of section 9 — read the corrections in 10.2 before acting on
+anything in section 9. Everything below was measured directly against the live site on the VM, not
+inferred from reading code. The output of this session is a written implementation spec,
+`SPEC - Parked Session Booker Daemon.md`, which is the authoritative design document going
+forward; this section records how it was arrived at and what it depends on.
+
+### 10.1 What this session did
+
+Instrumented the existing Playwright booker (`BOOKER_TRACE=1`), captured every HTTP request it
+makes, then reimplemented the entire booking flow with plain `requests` and ran it against the
+live site — including a real submit and delete. Then measured how long an authenticated session
+survives. Three artifacts came out of it: `probe_http_flow.py`, `test_session_longevity.py`, and
+the spec.
+
+### 10.2 Corrections to section 9 — do not act on the superseded versions
+
+1. **The 36-100s booker durations in 9.2 are stale.** They predate the event-driven-wait and
+   prefetch commits. A traced dry-run on current code measured **23.2s** end to end. The
+   improvements in `c7df3e8`/`21a88fa` did work; section 9.2's table describes older code.
+2. **"~30 second race window" (section 2.14, repeated in 9.2) is wrong as a general figure.** It
+   came from a single observation. `alerts_history.log` shows availability episodes lasting
+   **90-110 seconds**, recurring 4-7 minutes apart. The booker was not losing a 30-second race; it
+   was losing a ~10-15 second one, repeatedly, inside a much longer window.
+3. **9.2's two hypotheses for `no_time_slots` are both resolved.** Hypothesis (a), the booker is
+   too slow, is correct. Hypothesis (b), the `vastuvotukuupaevad` list is structurally stale, is
+   **not** needed to explain the data and is not supported: F7 below shows the dropdown tracks live
+   inventory. The gap between reading the date list and getting an empty slot answer was 2-12
+   seconds, which is simply enough time for another party to take it. The human owner independently
+   reproduced the same failure by hand in ~10-15 seconds, which is the strongest evidence.
+   **An earlier draft of this analysis claimed the two answers were ~1 second apart and therefore
+   structurally contradictory. That was an overstatement of the log timestamps and was withdrawn.**
+4. **9.3's list of "already optimized, don't re-suggest" is now partly obsolete**, because the
+   whole Playwright layer it describes is being replaced. Background CAPTCHA prefetching and the
+   `race` mode remain valid ideas; persistent Chromium, event-driven DOM waits and the flatpickr
+   retry loop become irrelevant once there is no browser.
+
+### 10.3 Measured facts (F1-F10 in the spec — summarised here so this file stays self-contained)
+
+- **F1.** The entire flow is ordinary Symfony form POSTs to `https://broneering.mfa.ee/en/` with a
+  rotating CSRF token. A fully browserless client completed a real booking at 04:48 UTC. No DOM,
+  no flatpickr, no Stimulus, no Turbo JS required.
+- **F2.** Both reCAPTCHAs are enforced server-side. Posting either gating step with an empty
+  `g-recaptcha-response` returns HTTP 200 with page text `"Booking failed"`. Tested explicitly on
+  both; there is no bypass.
+- **F3.** CapSolver solves measured at 14.6 / 15.8 / 19.8 / 25.0s (mean ~19s). All HTTP work in a
+  complete booking totals ~2.5s. **CAPTCHA is now ~90% of the critical path**; everything else is
+  rounding error.
+- **F4.** The browser is irrelevant to CAPTCHA difficulty. The solver works on its own
+  infrastructure from the sitekey and page URL alone; our client never renders the widget. Proven
+  by a browserless client booking successfully — the site does not bind the token to our IP.
+- **F5.** **A session lasts exactly 1440 seconds (24 minutes) and activity does not extend it.**
+  Established at t+22.0s, first dead response at t+1464.8s, while polling every 15s throughout —
+  so it is an absolute expiry, not an idle timeout. 1440 is PHP's default
+  `session.gc_maxlifetime`. Death signature: response still carries a CSRF token but
+  `input[name="broneering[kuupaev]"]` is gone (bounced to the start of the form). **Design should
+  operate on a 20-minute working number**, keeping 1440 as the known ceiling — the margin is cheap
+  and the measurement is from a single embassy on a single day.
+- **F6.** Once past the CAPTCHA gate, a date's free-times query needs no CAPTCHA and takes
+  195-620ms (median ~490ms over 95 polls). Repeatable indefinitely at zero cost.
+- **F7.** The service dropdown reflects **live inventory**, not a schedule. Proven accidentally:
+  our test booking consumed one of Abu Dhabi's two slots and D-visa disappeared from the dropdown;
+  deleting it brought the service back with both slots.
+- **F8.** **You cannot establish a session for a service that is not currently offered.** Both New
+  Delhi and Abu Dhabi refused to advance past service selection when D-visa was absent. This is the
+  binding constraint on any "keep a session warm" design — a session can only ever be acquired
+  opportunistically, after detection.
+- **F9.** Availability arrives in bursts: 2026-07-31 episodes at 05:57, 06:04, 06:30, 06:35, 06:40
+  UTC, each ~90-110s, separated by 4-7 minutes. 2026-07-30: 08:02, 11:08, 14:06. Because episodes
+  cluster more tightly than a session expires, **one session covers several episodes** — this is
+  what makes the chosen design viable despite F8.
+- **F10.** Slot inventory does not churn on its own: Abu Dhabi held a steady 2 slots across 93
+  consecutive polls over 24 minutes. The site does not spontaneously release and re-take slots.
+
+### 10.4 Two incidents worth recording
+
+1. **The monitor was down for ~45 minutes and nobody would have known.** `git pull` brought
+   digvijayv's `lxml`-using monitor onto a VM whose venv never had `lxml` installed (it postdates
+   the venv). Every cron tick died with `bs4.exceptions.FeatureNotFound`; `grep -c "MONITOR
+   FAILURE" monitor.log` showed 135. The failure-alert cooldown (1.5h) meant a single Telegram
+   alert covered the whole outage. Fixed with `venv/bin/pip install lxml`, and hardened
+   permanently: both `estonia_visa_monitor.py` and the new scripts now fall back to
+   `html.parser` when `lxml` is missing, since `lxml` buys a few milliseconds on a page this size
+   and the monitor's entire job is to not be down. **Lesson: never `git pull` onto the VM without
+   re-running `pip install -r requirements.txt`, and never let a missing optional dependency be an
+   outage.**
+2. **A dummy test booking was left live on Abu Dhabi and removed D-visa from its dropdown
+   entirely.** `probe_http_flow.py`'s cleanup matched the confirmation page's only `<form>` —
+   whose action is empty and whose sole field is the CSRF token — instead of the actual
+   `<a href="/en/delete?id=...">Delete</a>` link nested inside it, so it POSTed a no-op. The
+   booking survived, consumed one of two slots, and (with the other slot gone) took D-visa off the
+   dropdown until deleted by hand. Fixed: links now take priority over forms. **This is also how
+   F7 was discovered, so the bug paid for itself — but any future submit-and-delete test must
+   verify the delete, not assume it.**
+
+### 10.5 New artifacts
+
+| File | Purpose |
+|---|---|
+| `probe_http_flow.py` | Browserless replay of the full flow, `PROBE_BOOK=1` to submit+delete. **The proven HTTP recipe — reuse this code, don't rewrite it.** |
+| `test_session_longevity.py` | Establishes one session, parks it, polls free-times on a timer. Read-only by construction (contains no `broneeri` key at all). `AUTO_SERVICE=1` falls back to any offered service so it can run outside D-visa windows. |
+| `BOOKER_TRACE=1` in `estonia_d_visa_booker.py` | Per-step timing, full request/response capture with POST bodies, flatpickr-month and checkbox-visibility diagnostics. Off by default. |
+| `BOOKER_NO_SCREENSHOTS=1` | Dry-runs take ~13 full-page screenshots a live run never pays; this makes dry-run timings representative. |
+| `SPEC - Parked Session Booker Daemon.md` | The implementation spec. 42 numbered requirements, cost model, failure modes, test plan, and a required changelog format. |
+
+### 10.6 The decision taken, and the reasoning
+
+Three options were put to the owner: (1) drop the browser only, 25s -> ~20s, no ongoing cost;
+(2) a parked-session daemon, 25s -> ~1s, ~$6-15/month; (3) don't optimise, just instrument and
+wait for data. **Option 2 was chosen**, explicitly on the grounds that the owner is willing to pay
+$20-30/month to secure a single appointment, and that speed is now confirmed (not suspected) to be
+the failure mode.
+
+Core idea: pay the ~20s CAPTCHA cost once, early, then sit parked on the calendar page — where
+free-times can be checked every 2 seconds for free — and submit the instant a slot appears. F8
+means the seat can only be acquired after detection; F9 means one seat then covers several
+episodes.
+
+Two owner requirements were made explicit and are encoded as R1-R4 in the spec: **the monitor must
+be untouched and must keep alerting even if the daemon fails completely** (so a human can always
+book manually), and **every failure must log which step failed**.
+
+### 10.7 Hypotheses retired this session — do not revive
+
+- Checkboxes hidden from the automation (measured `attached: 2, visible: 2`).
+- The flatpickr day-click silently failing (`could not find a clickable flatpickr day` = 0 across
+  all 5 real runs; the click fired every time).
+- Multi-date fallback would have rescued the 5 failures (New Delhi offered exactly one date each
+  time). Still worth implementing — the current booker giving up after one date is a real bug —
+  but it is not why those five failed.
+- Real Chrome / warm browser profile / residential IP getting easier CAPTCHAs (F4). The
+  `BROWSER_CHANNEL`, `BROWSER_HEADLESS`, `BROWSER_USER_DATA_DIR` machinery is now known-pointless
+  and should not be carried forward.
+- Polling keeping a session alive (F5).
+- A 24/7 pre-solved CAPTCHA token reserve — still rejected, but now for a sharper reason: the
+  chosen design refreshes tokens *only while a seat is live*, which bounds the cost to ~$0.04/hr of
+  active holding instead of ~$35/month continuous.
+
+### 10.8 Open question the implementer must resolve first
+
+**Can the available-dates list be refreshed inside a live seat without a new CAPTCHA?** A seat
+acquired during episode 1 needs to see a *new* date appearing in episode 2. Unknown whether the
+step-5 response carries a fresh `data-vastuvotukuupaevad`, or whether another no-CAPTCHA route
+exists. This is R17 in the spec and is flagged as a stop-and-check point, because a negative answer
+materially changes the design.
+
+### 10.9 Deploy status as of the end of this session
+
+- `estonia_visa_monitor.py` is **live and healthy** on the VM after the `lxml` fix, logging
+  `NOT available` normally at the 10s cadence.
+- Commits `5dc496b` (the digvijayv regression fixes from section 9.1) and `63a0ddd` **have now been
+  pushed and pulled onto the VM** — section 9's warning about them being unpushed is resolved.
+- The Playwright booker remains the live booking path (`ENABLE_BOOKER` set, cron pointed at
+  `estonia_visa_monitor_booker_hook.py`). It is unchanged apart from the opt-in tracing. Nothing
+  from this session altered live booking behaviour.
+- The daemon does not exist yet. Implementation was deliberately handed to a separate, cheaper
+  session working from the spec, with a required changelog mapping every requirement ID so the
+  result can be reviewed against the spec rather than by reading all the code.

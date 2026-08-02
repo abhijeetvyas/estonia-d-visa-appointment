@@ -1,0 +1,18 @@
+# Matches estonia_visa_monitor.py's own /etc/logrotate.d/estonia-visa-monitor
+# config (see AI_CONTEXT.md §3) - daily, 7 rotations, compressed with
+# delaycompress, explicit create/su directives (required because these logs
+# live in a non-root-owned home directory).
+#
+# Install with: sudo cp estonia-booker-daemon.logrotate /etc/logrotate.d/estonia-booker-daemon
+
+/home/abhijeetvyas13/estonia-d-visa-appointment/daemon.log
+/home/abhijeetvyas13/estonia-d-visa-appointment/daemon_polls.csv {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 abhijeetvyas13 abhijeetvyas13
+    su abhijeetvyas13 abhijeetvyas13
+}
