@@ -77,6 +77,20 @@ EMBASSY_NAME = os.environ.get("EMBASSY_NAME", "New Delhi")
 
 SEAT_TTL_SECONDS = int(os.environ.get("SEAT_TTL_SECONDS", "1440"))          # R10: measured ceiling (F5)
 SEAT_RENEW_AFTER_SECONDS = int(os.environ.get("SEAT_RENEW_AFTER_SECONDS", "1200"))  # R10: operating number
+
+# Round-5 Fix 16: the real predictor of seat death. Three live runs at three
+# different poll cadences all died at ~95-100 REQUESTS, not at any fixed
+# duration - see SeatManager.maybe_renew()'s docstring. 70 leaves ~30 requests
+# of margin, which at the 2s poll cadence is ~60s of slack for an overlapping
+# replacement to finish establishing before the old seat would have died.
+SEAT_RENEW_AFTER_REQUESTS = int(os.environ.get("SEAT_RENEW_AFTER_REQUESTS", "70"))
+
+# Round-5 Fix 17: minimum gap between "the seat died" and starting a
+# replacement. Deliberately short (seat death is normal every ~190s, not an
+# error) - it exists only to stop a tight spin if acquisition fails instantly.
+SEAT_DEATH_REACQUIRE_COOLDOWN_SECONDS = float(
+    os.environ.get("SEAT_DEATH_REACQUIRE_COOLDOWN_SECONDS", "15")
+)
 SLOT_POLL_INTERVAL_SECONDS = float(os.environ.get("SLOT_POLL_INTERVAL_SECONDS", "2"))  # R15
 # Round-2 follow-up Fix 2: a new date appearing is an episode-scale event
 # (minutes apart, F9), not a sub-second one - refreshing the date list on
@@ -188,17 +202,29 @@ def dump_html(name: str, html: str) -> str:
 _csv_header_written = POLLS_CSV_FILE.exists() and POLLS_CSV_FILE.stat().st_size > 0
 
 
-def append_poll_csv(seat_age_s: float, date: str, slot_count: int, slot_times: list, query_ms: float, seat_alive: bool) -> None:
-    """R35: utc, seat_age_s, date, slot_count, slot_times, query_ms, seat_alive."""
+def append_poll_csv(seat_age_s: float, date: str, slot_count: int, slot_times: list, query_ms: float,
+                    seat_alive: bool, requests_used: int = -1) -> None:
+    """R35: utc, seat_age_s, date, slot_count, slot_times, query_ms, seat_alive.
+
+    Round-5 Fix 16 adds requests_used as a trailing column. The observed
+    ~95-100-request ceiling comes from only three runs on one embassy, so
+    every poll now records the counter - that turns the ceiling into
+    something measurable across many runs rather than something inferred
+    once and then trusted forever, which is exactly the mistake the original
+    "1440 seconds" figure represented.
+    """
     global _csv_header_written
     try:
         with open(POLLS_CSV_FILE, "a") as f:
             if not _csv_header_written:
-                f.write("utc,seat_age_s,date,slot_count,slot_times,query_ms,seat_alive\n")
+                f.write("utc,seat_age_s,date,slot_count,slot_times,query_ms,seat_alive,requests_used\n")
                 _csv_header_written = True
             utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
             times = "|".join(slot_times)
-            f.write(f"{utc},{seat_age_s:.1f},{date},{slot_count},{times},{query_ms:.0f},{seat_alive}\n")
+            f.write(
+                f"{utc},{seat_age_s:.1f},{date},{slot_count},{times},"
+                f"{query_ms:.0f},{seat_alive},{requests_used}\n"
+            )
     except Exception as e:
         log_line("INFO", f"Failed to append poll CSV (non-fatal): {e}")
 
@@ -726,6 +752,9 @@ class SeatManager:
         # this cooldown is a daemon-wide backstop on reacquisition frequency,
         # not a per-seat property, so it must survive seat swaps.
         self.last_reacquire_ts: float = 0.0
+        # Fix 17: separate from last_reacquire_ts (which gates the round-3
+        # SUSPECT path at 300s); death recovery needs a much shorter gate.
+        self.last_death_reacquire_ts: float = 0.0
 
         # Round-4 follow-up state (Fixes 13/14).
         # Fix 13: at most one booking attempt (on-demand solve + eventual
@@ -792,7 +821,7 @@ class SeatManager:
             self.token_reserve.start()
             log_line(
                 "SEAT_ACQUIRED",
-                f"dates_seen={seat.available_dates} age=0s",
+                f"dates_seen={seat.available_dates} age=0s requests_used={seat.requests_used}",
                 elapsed_since_trigger,
             )
             send_telegram(
@@ -811,17 +840,40 @@ class SeatManager:
             return False
 
     def maybe_renew(self) -> None:
-        """R10/R11: start an overlapping renewal once the current seat passes
-        SEAT_RENEW_AFTER_SECONDS. R12: only renew if D-visa is still offered
-        - otherwise let the old seat expire and go back to waiting for a
-        trigger (checked inside begin_overlapping_reacquire). R14: at most
-        one renewal/reacquisition in flight at a time, shared with round-3's
-        suspect-driven reacquisition (Fix 9) - see begin_overlapping_reacquire()."""
+        """R10/R11: start an overlapping renewal before the current seat dies.
+        R12: only renew if D-visa is still offered - otherwise let the old
+        seat expire and go back to waiting for a trigger (checked inside
+        begin_overlapping_reacquire). R14: at most one renewal/reacquisition
+        in flight at a time, shared with round-3's suspect-driven
+        reacquisition (Fix 9).
+
+        Round-5 Fix 16: renew on EITHER request count OR elapsed time,
+        whichever comes first.
+
+        Time alone was wrong. Spec F5 recorded a seat as lasting 1440s, but
+        three live runs at three different poll cadences all died at ~95-100
+        REQUESTS regardless of how long that took: ~98 requests at 1442s when
+        polling every 15s, ~100 requests at 190s when polling every 2s
+        (five consecutive times, 189-192s), ~95 requests at 138s with date
+        refreshes on top. The 1440s figure was an artifact of the original
+        measurement's 15s interval. At the daemon's 2s cadence a purely
+        time-based threshold of 1200s never fires, so every seat died
+        unrenewed and left a ~37s coverage gap.
+
+        Both conditions are kept deliberately rather than replacing one with
+        the other: the request-count evidence is strong but comes from one
+        embassy over one afternoon, and a genuine time cap may also exist
+        that we simply never isolated. Whichever binds first wins.
+        """
         if not self.has_live_seat():
             return
-        if self.seat.age_seconds() < SEAT_RENEW_AFTER_SECONDS:
+        used = self.seat.requests_used
+        age = self.seat.age_seconds()
+        if used >= SEAT_RENEW_AFTER_REQUESTS:
+            self.begin_overlapping_reacquire(reason=f"request_budget({used}/{SEAT_RENEW_AFTER_REQUESTS})")
             return
-        self.begin_overlapping_reacquire(reason="ttl_renewal")
+        if age >= SEAT_RENEW_AFTER_SECONDS:
+            self.begin_overlapping_reacquire(reason=f"ttl_renewal({age:.0f}s)")
 
     def begin_overlapping_reacquire(self, reason: str) -> bool:
         """Round-3 Fix 9: the SAME overlapping-renewal machinery R11 already
@@ -853,7 +905,8 @@ class SeatManager:
             try:
                 log_line(
                     "SEAT_RENEWING",
-                    f"reason={reason} old_seat_age={self.seat.age_seconds():.0f}s" if self.seat else f"reason={reason}",
+                    f"reason={reason} old_seat_age={self.seat.age_seconds():.0f}s "
+                    f"old_seat_requests={self.seat.requests_used}" if self.seat else f"reason={reason}",
                 )
                 # Fix 11: applies here too, per round 4's instructions - a
                 # swapped-in seat should also arrive with a warm reserve
@@ -877,6 +930,7 @@ class SeatManager:
                 new_seat = establish_seat(EMBASSY_ID, applicant, captcha_token, session=session)
                 cache_applicant_on_seat(new_seat, applicant)
                 old_age = self.seat.age_seconds() if self.seat else None
+                old_used = self.seat.requests_used if self.seat else None
                 self.seat = new_seat  # atomic reference swap - old seat served every poll up to this instant
                 # Same scheduling reset as a fresh acquire() (see __init__'s
                 # comment) - a swapped-in seat is, for polling/refresh/
@@ -888,7 +942,8 @@ class SeatManager:
                 self.empty_poll_streak = 0
                 log_line(
                     "SEAT_SWAPPED",
-                    f"reason={reason} old_seat_age={old_age:.0f}s new_dates={new_seat.available_dates}",
+                    f"reason={reason} old_seat_age={old_age:.0f}s old_seat_requests={old_used} "
+                    f"new_dates={new_seat.available_dates} new_seat_requests={new_seat.requests_used}",
                 )
             except Exception as e:
                 log_line("INFO", f"Seat reacquire ({reason}) failed (old seat kept until it expires/dies): {e}")
@@ -905,8 +960,57 @@ class SeatManager:
         signature yet - this is a sanity backstop, not the primary detection
         mechanism (which is is_seat_dead(), checked on every poll)."""
         if self.seat and self.seat.age_seconds() > SEAT_TTL_SECONDS:
-            log_line("SEAT_EXPIRED", f"age={self.seat.age_seconds():.0f}s > SEAT_TTL_SECONDS={SEAT_TTL_SECONDS}")
+            log_line(
+                "SEAT_EXPIRED",
+                f"age={self.seat.age_seconds():.0f}s > SEAT_TTL_SECONDS={SEAT_TTL_SECONDS} "
+                f"requests_used={self.seat.requests_used}",
+            )
             self.drop_seat()
+
+    def begin_background_acquire(self, reason: str) -> bool:
+        """Round-5 Fix 17: acquire a replacement seat off the main thread
+        after the current one has already died.
+
+        Distinct from `begin_overlapping_reacquire()`, which requires a live
+        seat to overlap with - by the time this is called there is nothing
+        left to overlap. Before this existed, a dead seat simply waited for
+        the monitor's next trigger before being replaced, which produced ~37s
+        of zero coverage after every death (observed five times in one 30-min
+        run, /tmp/daemon_t5.log). Since seats now die roughly every ~190s at
+        the 2s poll cadence (Fix 16), those gaps would have been a permanent
+        feature of normal operation, not an edge case.
+
+        Deliberate deviation from the round-5 instruction to reuse
+        REACQUIRE_COOLDOWN_SECONDS (300s) here: seat death is EXPECTED every
+        ~190s, so a 5-minute cooldown would leave the daemon seatless most of
+        the time - it would convert a 37s gap into a 110s one. A short
+        dedicated cooldown prevents a tight spin if acquisition fails
+        immediately, while MAX_SOLVES_PER_HOUR (60/hr, versus the ~19/hr this
+        implies) remains the real spend backstop.
+        """
+        now = time.time()
+        if (now - self.last_death_reacquire_ts) < SEAT_DEATH_REACQUIRE_COOLDOWN_SECONDS:
+            return False
+        with self._renewal_lock:
+            if self._renewal_in_progress:
+                return False
+            self._renewal_in_progress = True
+        self.last_death_reacquire_ts = now
+
+        def _run():
+            try:
+                log_line("SEAT_ACQUIRING", f"reason={reason} (replacing a dead seat)")
+                # acquire() sets self.seat itself and does its own D-visa
+                # gate check (F8), so a withdrawn service is handled there.
+                self.acquire()
+            except Exception as e:
+                log_line("INFO", f"Background reacquire after seat death failed: {e}")
+            finally:
+                with self._renewal_lock:
+                    self._renewal_in_progress = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
 
     def drop_seat(self) -> None:
         self.seat = None
@@ -1202,9 +1306,8 @@ def maybe_refresh_dates(seat_mgr: SeatManager, forced: bool, elapsed_since_trigg
         # session (R16) - see seat_mgr.session_lock's definition.
         with seat_mgr.session_lock:
             new_dates = resolve_r17_refresh_dates(seat)
-    except SeatDeadError:
-        log_line("SEAT_DIED", "detected during R17 date-list refresh", elapsed_since_trigger)
-        seat_mgr.drop_seat()
+    except SeatDeadError as e:
+        handle_seat_death(seat_mgr, e, "detected during R17 date-list refresh", elapsed_since_trigger)
         return True
     except Exception as e:
         # Don't let a transient failure make forced/urgent refreshes retry
@@ -1221,7 +1324,8 @@ def maybe_refresh_dates(seat_mgr: SeatManager, forced: bool, elapsed_since_trigg
     seat_mgr.last_date_refresh_ts = time.time()
     if forced:
         seat_mgr.last_forced_refresh_ts = time.time()
-    append_poll_csv(seat.age_seconds(), "__DATE_REFRESH__", len(new_dates), new_dates, query_ms, seat.alive)
+    append_poll_csv(seat.age_seconds(), "__DATE_REFRESH__", len(new_dates), new_dates, query_ms,
+                    seat.alive, seat.requests_used)
     log_line("INFO", f"Date-list refresh (forced={forced}): dates={new_dates} query_ms={query_ms:.0f}")
     return False
 
@@ -1318,6 +1422,36 @@ def check_suspect_and_maybe_reacquire(seat_mgr: SeatManager, elapsed_since_trigg
     seat_mgr.begin_overlapping_reacquire(reason="suspect")
 
 
+def handle_seat_death(seat_mgr: "SeatManager", exc: SeatDeadError, where: str,
+                      elapsed_since_trigger: Optional[float]) -> None:
+    """Round-5 Fixes 17+18: single place that reacts to a seat dying.
+
+    Fix 18 - dump the response body. Seat death has only ever been INFERRED
+    from a selector signature (CSRF token present, `broneering[kuupaev]`
+    absent); nobody has looked at what the server actually sends. A
+    validation-error page would match that same signature, so without a dump
+    we cannot distinguish a genuine session expiry from a misread error page.
+    One real dump settles it.
+
+    Fix 17 - start a replacement immediately instead of waiting for the
+    monitor's next trigger.
+    """
+    seat = seat_mgr.seat
+    used = seat.requests_used if seat is not None else -1
+    age = seat.age_seconds() if seat is not None else -1.0
+    path = dump_html("seat_died", getattr(exc, "html", "") or "(no body captured)")
+    log_line(
+        "SEAT_DIED",
+        f"{where} after requests_used={used} age={age:.0f}s "
+        f"(renew threshold was {SEAT_RENEW_AFTER_REQUESTS} requests / "
+        f"{SEAT_RENEW_AFTER_SECONDS:.0f}s) - dump: {path}",
+        elapsed_since_trigger,
+    )
+    seat_mgr.drop_seat()
+    if not is_already_booked():
+        seat_mgr.begin_background_acquire(reason="seat_died")
+
+
 # ---------------------------------------------------------------------------
 # Main poll cycle while a seat is live (R15-R22, R35)
 # ---------------------------------------------------------------------------
@@ -1363,16 +1497,16 @@ def poll_cycle(seat_mgr: SeatManager, elapsed_since_trigger: Optional[float]) ->
             # ~15-25s CAPTCHA solve that used to precede it.
             with seat_mgr.session_lock:
                 slots = query_free_times(seat, date_iso)
-        except SeatDeadError:
-            log_line("SEAT_DIED", f"detected while querying {date_iso}", elapsed_since_trigger)
-            seat_mgr.drop_seat()
+        except SeatDeadError as e:
+            handle_seat_death(seat_mgr, e, f"detected while querying {date_iso}", elapsed_since_trigger)
             return False
         except Exception as e:
             log_line("INFO", f"Query failed for {date_iso} (non-fatal, will retry next cycle): {e}")
             continue
         query_ms = (time.time() - q0) * 1000
         times = [s.time for s in slots]
-        append_poll_csv(seat.age_seconds(), date_iso, len(slots), times, query_ms, seat.alive)
+        append_poll_csv(seat.age_seconds(), date_iso, len(slots), times, query_ms,
+                        seat.alive, seat.requests_used)
         log_line("POLL_RESULT", f"date={date_iso} slots={len(slots)} times={times} query_ms={query_ms:.0f}")
 
         if not slots:

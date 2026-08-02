@@ -727,3 +727,126 @@ No deviations from the five fixes as specified. Two implementation choices were 
 2. **`booking_in_progress`'s single-flight guard means a genuinely-different, better slot found while an earlier (worse) slot's booking attempt is still solving/submitting is NOT tried until the first attempt resolves.** Given R20/R21's preference ordering already picks the best available slot first and R22 walks every date within one `poll_cycle()` pass before giving up, this should rarely matter in practice (the "first" attempt dispatched is already the preferred one), but it is a real, if narrow, trade-off of "sequential and correct" against "always chase the single best-known slot."
 3. **Fix 15's episode definition (`update_episode_start()`) reuses `TRIGGER_FRESH_WINDOW_SECONDS` (60s, round 3's Fix 7 constant) as the episode-gap threshold.** This is a clean, low-footprint choice (one constant instead of two), but it does mean tuning one changes the meaning of both "is this seat's suspect evidence still fresh" (Fix 7) and "has a new episode begun" (Fix 15) together. If real episode timing (F9: 4-7 minute gaps between clusters, ~90-110s within a cluster) ever calls for treating these as genuinely different thresholds, they can be split into two constants later - not done here to keep this round's footprint to what was actually asked for.
 4. **This round did not re-verify R17 or re-run the round-3 suspect-detection worked example against the new Fix-13 session-locking behavior.** Fix 13 adds contention (however brief) between `poll_cycle()`'s queries, `maybe_refresh_dates()`'s R17 refresh, and a backgrounded submit, all now serialized through the same `session_lock` - in the extremely unlikely event all three want the lock at once, whichever loses waits a sub-second beat, which should be immaterial to round 3's `empty_poll_streak`/suspect-detection timing (poll cadence is 2s, sub-second lock contention is noise by comparison), but this interaction was reasoned through rather than empirically re-tested end-to-end.
+
+## 11. Follow-up fixes (round 5)
+
+Implemented by: Claude (Opus, Cowork session) — directly, not delegated. Date: 2026-08-02. Branch: `gcp-daemon`.
+
+**The finding this round acts on.** Spec F5 recorded a seat as lasting **1440 seconds** on an
+absolute, activity-independent timer. That was wrong, and the error was load-bearing. Three live
+runs at three different poll cadences:
+
+| Run | Cadence | Died after | Requests used |
+|---|---|---|---|
+| `test_session_longevity.py` | 1 poll / 15s | 1442s | ~98 |
+| `/tmp/daemon_t2b.log` | 1 poll / 2s + date refreshes | 138s | ~95 |
+| `/tmp/daemon_t5.log` (5 consecutive deaths) | 1 poll / 2s | 189, 190, 190, 192, 191s | ~100 each |
+
+Durations differ by more than 10×; request counts are essentially identical. **A session expires
+after roughly 95–100 requests**, and the 1440s figure was an artifact of the original measurement
+polling every 15 seconds. PHP's default `session.gc_maxlifetime = 1440` matching it was a
+coincidence that made a wrong conclusion look well-supported — a reminder that a single measurement
+plus a plausible mechanism is not evidence.
+
+Consequence in production terms: at the 2s poll cadence, `SEAT_RENEW_AFTER_SECONDS=1200` could
+never fire before death at ~190s. Every seat died unrenewed, and the daemon then waited for the
+monitor's next trigger before replacing it.
+
+### Fix table
+
+| Fix | Description | Status | Where |
+|-----|-------------|--------|-------|
+| 16 | Renew on request count OR elapsed time, whichever binds first | Done | `estonia_booking_http.py` `_throttled()` (per-session counting), `Seat.requests_used` property; `estonia_booker_daemon.py` `SEAT_RENEW_AFTER_REQUESTS` config + `SeatManager.maybe_renew()` |
+| 17 | A dead seat starts its replacement immediately instead of waiting for the next trigger | Done | `SeatManager.begin_background_acquire()`, called from `handle_seat_death()` |
+| 18 | Dump the response body on `SEAT_DIED` | Done | `SeatDeadError` now carries `.html`; both raise sites pass it; `handle_seat_death()` writes it via `dump_html()` |
+| 19 | Document the poll-cadence / seat-life tradeoff | Done | `BOOKER_README.md`, "Seat lifetime is a request budget, not a clock" |
+
+**Where the counting happens.** `_throttled()` was already the single unbypassable chokepoint for
+site traffic (round 2, Fix 3), so the counter went there — a request cannot be made without being
+counted. It increments on the `requests.Session` (reached via the bound method's `__self__`)
+because the session is the unit the server's budget actually applies to. That also means the ~5
+setup requests, and the `check_service_offered` probe that shares the session, are included
+automatically. `Seat.requests_used` is a property reading straight off the session rather than a
+separately maintained integer, so it cannot drift.
+
+### Coverage gap: 30 minutes of continuous holding at 2s polling
+
+**Before.** Measured directly from `/tmp/daemon_t5.log`, five deaths in one 30-minute run:
+
+```
+died 18:28:29 -> reacquired 18:29:06   37s blind
+died 18:32:16 -> reacquired 18:32:37   21s blind
+died 18:35:47 -> reacquired 18:36:18   31s blind
+died 18:39:30 -> reacquired 18:40:01   31s blind
+died 18:43:10 -> reacquired 18:44:02   52s blind
+                                      ----
+                                      172s blind out of ~1730s  =  ~10% of the window
+```
+
+**After.** Renewal fires at 70 requests. A seat is established at request ~5 and spends 1 request
+per 2s poll, so 70 is reached at roughly `(70 − 5) × 2 = 130s`. The overlapping replacement takes
+~30s to establish, during which the old seat keeps polling and reaches ~85 requests — still inside
+the ~95–100 ceiling, with ~15 requests of margin — and then the swap happens by reference.
+
+```
+Reacquisitions in 30 min:  1800 / 130  ≈  14
+Blind seconds:             0  (replacement is verified before the old seat is released)
+CAPTCHA cost:              14 × $0.0008 ≈ $0.011 per 30 min held
+```
+
+`handle_seat_death()` remains as the safety net for a seat that dies anyway (a wrong threshold, an
+unexpectedly short session, a server-side restart), and now recovers in ~30s instead of waiting an
+unbounded time for the next trigger.
+
+### Deviation from the round-5 instruction
+
+**Death recovery does NOT reuse `REACQUIRE_COOLDOWN_SECONDS` (300s), as instructed.** Applying a
+5-minute cooldown to seat-death recovery would have been actively harmful: with seats dying every
+~190s, the daemon would have spent more time seatless than seated — it would have converted a 37s
+gap into a ~110s one. A dedicated `SEAT_DEATH_REACQUIRE_COOLDOWN_SECONDS` (default 15s) prevents a
+tight spin if acquisition fails instantly, while `MAX_SOLVES_PER_HOUR` (60/hr, against the ~28/hr
+this implies) remains the real spend backstop. The 300s cooldown still governs the round-3
+*suspect* path, where it belongs, because a suspect firing is genuinely abnormal.
+
+This is the same class of error as round 2's Fix 5: a threshold chosen for a condition assumed to
+be rare, applied to one that turns out to be routine.
+
+### Test results
+
+`python3 test_daemon_units.py` — **70 checks, all passed** (was 58 before this round). New:
+
+```
+[PASS] Fix 16: a fresh session starts with no request_count attribute (reads as 0)
+[PASS] Fix 16: _throttled() increments the counter on the owning session
+[PASS] Fix 16: Seat.requests_used reads straight off its session (cannot drift)
+[PASS] Fix 16: below BOTH thresholds -> no renewal
+[PASS] Fix 16: request budget reached while still young -> renews (the case time-only missed entirely)
+[PASS] Fix 16: time threshold still honoured when request count is low (belt-and-braces kept deliberately)
+[PASS] Fix 16: no live seat -> maybe_renew is a no-op
+[PASS] Fix 18: seat death writes the response body to a dump (death has only ever been inferred until now)
+[PASS] Fix 17: seat death drops the seat AND immediately starts a replacement (no waiting for the next trigger)
+[PASS] Fix 17: once booked, a dying seat is dropped but NOT replaced
+[PASS] Fix 17: first death-recovery acquire starts, second within the cooldown is suppressed
+[PASS] Fix 17: once the cooldown elapses, death recovery is allowed again
+```
+
+The cooldown test deliberately sleeps 0.25s between the two calls so the spawned thread finishes
+and `_renewal_in_progress` clears — otherwise the second call would be rejected by the concurrency
+guard rather than the cooldown, and the test would pass for the wrong reason.
+
+`git diff --stat estonia_visa_monitor.py` — empty. R1 still holds.
+
+### Not verified, and what to watch
+
+- **The ~95–100 ceiling comes from three runs on one embassy in one afternoon.** Both the request
+  and time thresholds are therefore kept, whichever binds first. Every poll now records
+  `requests_used` in `daemon_polls.csv` so the real ceiling can be measured properly rather than
+  inferred again.
+- **No `SEAT_DIED` dump has been captured yet.** Fix 18 is the instrumentation, not the answer. The
+  first real dump will settle whether this is a genuine session expiry or `is_seat_dead()`
+  misreading a validation-error page — the signature (token present, `kuupaev` absent) would match
+  both.
+- **Fix 16 has not been exercised against the live site.** The next Abu Dhabi run should show
+  `SEAT_RENEWING reason=request_budget(...)` firing at ~130s with **no** `SEAT_DIED` at all. If
+  `SEAT_DIED` still appears, the ceiling is lower than 100 for that session and the threshold needs
+  lowering.

@@ -815,6 +815,187 @@ def main() -> int:
         daemon.update_episode_start(None, t0, t0 + 1) == t0 + 1,
     )
 
+    # =========================================================================
+    # Round-5 Fixes 16-18: request-budget renewal, death recovery, death dump
+    # =========================================================================
+    #
+    # Context: spec F5 claimed a seat lasts 1440s on an absolute timer. Three
+    # live runs at three different poll cadences instead all died at ~95-100
+    # REQUESTS (~98 at 1442s polling every 15s; ~100 at 190s polling every 2s,
+    # five times running; ~95 at 138s with date refreshes on top). The 1440s
+    # figure was an artifact of the original measurement's interval. These
+    # tests pin the corrected behaviour.
+
+    # --- Fix 16: _throttled() counts requests onto the session --------------
+    sess = http_flow.new_session()
+    check(
+        "Fix 16: a fresh session starts with no request_count attribute (reads as 0)",
+        getattr(sess, "request_count", 0) == 0,
+    )
+    # `sess.close` is a real bound method of requests.Session that makes no
+    # network call - exactly what's needed to exercise _throttled's counting
+    # without touching the live site.
+    for _ in range(3):
+        http_flow._throttled(sess.close)
+    check(
+        "Fix 16: _throttled() increments the counter on the owning session",
+        sess.request_count == 3,
+        f"got {getattr(sess, 'request_count', None)}",
+    )
+
+    counted_seat = http_flow.Seat(
+        session=sess, embassy_id="244", token="tok",
+        established_at=time_module.time(), available_dates=[], last_seen_dates=[],
+    )
+    check(
+        "Fix 16: Seat.requests_used reads straight off its session (cannot drift)",
+        counted_seat.requests_used == 3,
+        f"got {counted_seat.requests_used}",
+    )
+
+    # --- Fix 16: renewal fires on whichever threshold binds first -----------
+    renew_calls: list[str] = []
+    real_begin_overlap = daemon.SeatManager.begin_overlapping_reacquire
+    daemon.SeatManager.begin_overlapping_reacquire = (
+        lambda self, reason: (renew_calls.append(reason) or True)
+    )
+    try:
+        def seat_with(used: int, age: float) -> http_flow.Seat:
+            s = http_flow.new_session()
+            s.request_count = used
+            return http_flow.Seat(
+                session=s, embassy_id="244", token="tok",
+                established_at=time_module.time() - age,
+                available_dates=["2026-08-18"], last_seen_dates=["2026-08-18"],
+            )
+
+        mgr = daemon.SeatManager()
+
+        renew_calls.clear()
+        mgr.seat = seat_with(used=daemon.SEAT_RENEW_AFTER_REQUESTS - 1, age=1.0)
+        mgr.maybe_renew()
+        check(
+            "Fix 16: below BOTH thresholds -> no renewal",
+            renew_calls == [],
+            f"got {renew_calls}",
+        )
+
+        renew_calls.clear()
+        mgr.seat = seat_with(used=daemon.SEAT_RENEW_AFTER_REQUESTS, age=1.0)
+        mgr.maybe_renew()
+        check(
+            "Fix 16: request budget reached while still young -> renews (the case time-only missed entirely)",
+            len(renew_calls) == 1 and "request_budget" in renew_calls[0],
+            f"got {renew_calls}",
+        )
+
+        renew_calls.clear()
+        mgr.seat = seat_with(used=1, age=daemon.SEAT_RENEW_AFTER_SECONDS + 1)
+        mgr.maybe_renew()
+        check(
+            "Fix 16: time threshold still honoured when request count is low (belt-and-braces kept deliberately)",
+            len(renew_calls) == 1 and "ttl_renewal" in renew_calls[0],
+            f"got {renew_calls}",
+        )
+
+        renew_calls.clear()
+        mgr.seat = None
+        mgr.maybe_renew()
+        check(
+            "Fix 16: no live seat -> maybe_renew is a no-op",
+            renew_calls == [],
+            f"got {renew_calls}",
+        )
+    finally:
+        daemon.SeatManager.begin_overlapping_reacquire = real_begin_overlap
+
+    # --- Fixes 17/18: seat death dumps HTML and starts a replacement --------
+    acquire_calls: list[str] = []
+    dumped: list[str] = []
+    real_begin_bg = daemon.SeatManager.begin_background_acquire
+    real_dump = daemon.dump_html
+    real_booked = daemon.is_already_booked
+    daemon.SeatManager.begin_background_acquire = (
+        lambda self, reason: (acquire_calls.append(reason) or True)
+    )
+    daemon.dump_html = lambda name, html: (dumped.append((name, html)) or "/tmp/fake_dump.html")
+    daemon.is_already_booked = lambda: False
+    try:
+        mgr = daemon.SeatManager()
+        s = http_flow.new_session()
+        s.request_count = 97
+        mgr.seat = http_flow.Seat(
+            session=s, embassy_id="244", token="tok",
+            established_at=time_module.time() - 190,
+            available_dates=["2026-08-18"], last_seen_dates=["2026-08-18"],
+        )
+        exc = http_flow.SeatDeadError("dead", html="<html>server said something</html>")
+        with contextlib.redirect_stdout(io.StringIO()):
+            daemon.handle_seat_death(mgr, exc, "detected while querying 2026-08-18", 5.0)
+
+        check(
+            "Fix 18: seat death writes the response body to a dump (death has only ever been inferred until now)",
+            len(dumped) == 1 and dumped[0][0] == "seat_died"
+            and "server said something" in dumped[0][1],
+            f"got {dumped}",
+        )
+        check(
+            "Fix 17: seat death drops the seat AND immediately starts a replacement (no waiting for the next trigger)",
+            mgr.seat is None and acquire_calls == ["seat_died"],
+            f"seat={mgr.seat} acquire_calls={acquire_calls}",
+        )
+
+        # Already-booked must not trigger pointless reacquisition.
+        acquire_calls.clear()
+        daemon.is_already_booked = lambda: True
+        mgr.seat = http_flow.Seat(
+            session=http_flow.new_session(), embassy_id="244", token="tok",
+            established_at=time_module.time(), available_dates=[], last_seen_dates=[],
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            daemon.handle_seat_death(mgr, exc, "whatever", None)
+        check(
+            "Fix 17: once booked, a dying seat is dropped but NOT replaced",
+            mgr.seat is None and acquire_calls == [],
+            f"acquire_calls={acquire_calls}",
+        )
+    finally:
+        daemon.SeatManager.begin_background_acquire = real_begin_bg
+        daemon.dump_html = real_dump
+        daemon.is_already_booked = real_booked
+
+    # --- Fix 17: the short death cooldown stops a tight spin ----------------
+    spawned: list[str] = []
+    real_acquire = daemon.SeatManager.acquire
+    daemon.SeatManager.acquire = lambda self, elapsed_since_trigger=None: (spawned.append("acq") or True)
+    try:
+        mgr = daemon.SeatManager()
+        with contextlib.redirect_stdout(io.StringIO()):
+            first = mgr.begin_background_acquire(reason="seat_died")
+            # Let the spawned thread finish so _renewal_in_progress clears and
+            # the SECOND call is gated by the cooldown, not by the concurrency
+            # guard - otherwise this would pass for the wrong reason.
+            time_module.sleep(0.25)
+            second = mgr.begin_background_acquire(reason="seat_died")
+        check(
+            "Fix 17: first death-recovery acquire starts, second within the cooldown is suppressed",
+            first is True and second is False,
+            f"first={first} second={second}",
+        )
+        mgr.last_death_reacquire_ts = time_module.time() - (
+            daemon.SEAT_DEATH_REACQUIRE_COOLDOWN_SECONDS + 1
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            third = mgr.begin_background_acquire(reason="seat_died")
+            time_module.sleep(0.25)
+        check(
+            "Fix 17: once the cooldown elapses, death recovery is allowed again",
+            third is True,
+            f"third={third}",
+        )
+    finally:
+        daemon.SeatManager.acquire = real_acquire
+
     print()
     if FAILURES:
         print(f"FAILED: {len(FAILURES)} check(s): {FAILURES}")

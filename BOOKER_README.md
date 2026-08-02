@@ -481,11 +481,16 @@ export EMBASSY_ID="40"
 export EMBASSY_NAME="New Delhi"
 
 # Seat lifecycle
-export SEAT_TTL_SECONDS=1440           # measured hard ceiling (F5) - sanity backstop, not the operating number
-export SEAT_RENEW_AFTER_SECONDS=1200   # start overlapping renewal at 20 minutes
+export SEAT_TTL_SECONDS=1440           # time-based backstop only - see the note below, this is NOT what kills a seat
+export SEAT_RENEW_AFTER_SECONDS=1200   # time-based renewal trigger (rarely the binding one)
+export SEAT_RENEW_AFTER_REQUESTS=70    # request-based renewal trigger - THIS is the one that normally fires
+export SEAT_DEATH_REACQUIRE_COOLDOWN_SECONDS=15  # min gap before replacing a seat that died anyway
 
 # Slot polling / CAPTCHA reserve
 export SLOT_POLL_INTERVAL_SECONDS=2
+# ^ Read the "Seat lifetime is a request budget" note below before changing
+#   this. Polling faster does not just cost bandwidth - it spends the seat's
+#   fixed request budget faster, so it directly shortens seat lifetime.
 export TOKEN_REFRESH_SECONDS=75
 export TOKEN_MAX_AGE_SECONDS=100
 
@@ -693,3 +698,45 @@ git checkout gcp-booker
 ```
 
 The original `gcp-setup` branch and all previous monitor behaviour stay completely intact.
+
+### Seat lifetime is a request budget, not a clock (Fix 16 — read before tuning the poll cadence)
+
+The spec's original F5 said a seat lasts **1440 seconds** on an absolute timer. That is **wrong**,
+and it mattered: at the daemon's 2-second poll cadence, a time-based renewal threshold of 1200s
+never fired, so every seat died unrenewed and left a ~37-second coverage gap while a fresh one was
+acquired.
+
+Three live runs at three different cadences, all against Abu Dhabi on 2026-08-02:
+
+| Run | Poll interval | Died after | Requests used |
+|---|---|---|---|
+| `test_session_longevity.py` | 15s | 1442s | ~98 |
+| Daemon, `/tmp/daemon_t2b.log` | 2s + date refreshes | 138s | ~95 |
+| Daemon, `/tmp/daemon_t5.log` (×5 consecutive) | 2s | 189–192s | ~100 |
+
+Wildly different durations, essentially identical request counts. **A session expires after roughly
+95–100 requests, regardless of how long it takes to spend them.** The 1440s figure was an artifact
+of the original measurement happening to poll every 15 seconds — and PHP's default
+`session.gc_maxlifetime = 1440` matching it was a coincidence that made a wrong conclusion look
+well-supported.
+
+**What this means when tuning `SLOT_POLL_INTERVAL_SECONDS`:**
+
+| Poll interval | Approx. seat lifetime | Reacquisitions per hour | Worst-case detection lag |
+|---|---|---|---|
+| 2s (default) | ~190s | ~19 | 2s |
+| 5s | ~475s | ~8 | 5s |
+| 10s | ~950s | ~4 | 10s |
+
+At roughly $0.0008 per CAPTCHA, even the 2s column is about 1.5 cents an hour, so cost is not the
+reason to slow down. The default stays at 2s because competitors have been observed taking slots
+within 10–15 seconds, and reacquisition is now overlapping (Fix 16) so the churn costs no coverage.
+Move to 5s if the site ever shows signs of objecting to the request volume — it would still beat
+the observed competition comfortably.
+
+`SEAT_RENEW_AFTER_REQUESTS=70` leaves ~30 requests of headroom against the observed ceiling, which
+at 2s is about 60 seconds of slack for the replacement seat to finish establishing. Both the
+request threshold and the time threshold are kept, whichever binds first: the request-count
+evidence is strong but comes from one embassy on one afternoon, and a genuine time cap may also
+exist that was never isolated. Every poll now records `requests_used` in `daemon_polls.csv`, so the
+real ceiling can be measured across many runs instead of inferred from three.

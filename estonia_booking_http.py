@@ -211,8 +211,28 @@ _RATE_LIMITER = RateLimiter(
 def _throttled(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     """Blocks on the global rate limiter, then calls fn(*args, **kwargs).
     Every `session.get(...)`/`session.post(...)` call to the live site in
-    this module goes through this - see the section comment above."""
+    this module goes through this - see the section comment above.
+
+    Round-5 Fix 16: this is also where per-session request counting happens.
+    Measurements on 2026-08-02 (three runs at three different poll cadences)
+    showed a session expires after roughly 95-100 REQUESTS, not after any
+    fixed wall-clock duration - the original "1440 seconds" figure turned out
+    to be an artifact of that one measurement having polled every 15s
+    (~98 requests happens to land at ~1442s). See IMPLEMENTATION_CHANGELOG.md
+    §11 and AI_CONTEXT.md F5's correction.
+
+    Counting here rather than at each call site is deliberate: this function
+    is already the single unbypassable chokepoint for site traffic (Fix 3),
+    so a request cannot be made without being counted. The counter lives on
+    the `requests.Session` because that IS the unit the server's budget
+    applies to - which also means setup requests (steps 0-4, plus the
+    `check_service_offered` probe that shares the same session) are included
+    automatically, with no risk of under-counting a seat's true usage.
+    """
     _RATE_LIMITER.acquire()
+    owner = getattr(fn, "__self__", None)
+    if isinstance(owner, requests.Session):
+        owner.request_count = getattr(owner, "request_count", 0) + 1
     return fn(*args, **kwargs)
 
 
@@ -236,7 +256,19 @@ class SeatDeadError(RuntimeError):
     """Raised by query_free_times()/refresh_dates() when the seat-death
     signature (R13) is detected: a response still carries a CSRF token but
     the date field (`input[name="broneering[kuupaev]"]`) is gone - i.e. we
-    were bounced back to the start of the form (F5)."""
+    were bounced back to the start of the form (F5).
+
+    Round-5 Fix 18: carries the offending response body. Seat death has only
+    ever been *inferred* from that selector signature - nobody has looked at
+    what the server actually returns. A validation-error page would match the
+    same signature, so a real dump is the only way to tell a genuine session
+    expiry from a misread error page. Callers are expected to write
+    `.html` to disk (see the daemon's `dump_html`).
+    """
+
+    def __init__(self, message: str, html: str = ""):
+        super().__init__(message)
+        self.html = html
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +300,19 @@ class Seat:
 
     def age_seconds(self) -> float:
         return time.time() - self.established_at
+
+    @property
+    def requests_used(self) -> int:
+        """Round-5 Fix 16: how many site requests this seat's session has
+        made, including the ~5 spent establishing it. Read straight off the
+        session (incremented in `_throttled`) rather than tracked separately,
+        so it cannot drift out of sync with reality.
+
+        This, not `age_seconds()`, is the number that predicts when the seat
+        will die: observed ceiling is ~95-100 requests regardless of how long
+        that takes to spend.
+        """
+        return getattr(self.session, "request_count", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +572,11 @@ def resolve_r17_refresh_dates(seat: Seat) -> list[str]:
 
     if is_seat_dead(r.text):
         seat.alive = False
-        raise SeatDeadError("seat died during R17 date-refresh (step-4 replay)")
+        raise SeatDeadError(
+            f"seat died during R17 date-refresh (step-4 replay) after "
+            f"{seat.requests_used} requests / {seat.age_seconds():.0f}s",
+            html=r.text,
+        )
 
     soup = BeautifulSoup(r.text, HTML_PARSER)
     cal = soup.find(attrs={"data-controller": "broneering"})
@@ -587,7 +636,11 @@ def query_free_times(seat: Seat, date_iso: str) -> list[Slot]:
 
     if is_seat_dead(r.text):
         seat.alive = False
-        raise SeatDeadError(f"seat died while querying free times for {date_iso}")
+        raise SeatDeadError(
+            f"seat died while querying free times for {date_iso} after "
+            f"{seat.requests_used} requests / {seat.age_seconds():.0f}s",
+            html=r.text,
+        )
 
     soup = BeautifulSoup(r.text, HTML_PARSER)
     seat.token = extract_token(r.text) or seat.token

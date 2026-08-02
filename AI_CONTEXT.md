@@ -658,13 +658,23 @@ the spec.
 - **F4.** The browser is irrelevant to CAPTCHA difficulty. The solver works on its own
   infrastructure from the sitekey and page URL alone; our client never renders the widget. Proven
   by a browserless client booking successfully — the site does not bind the token to our IP.
-- **F5.** **A session lasts exactly 1440 seconds (24 minutes) and activity does not extend it.**
-  Established at t+22.0s, first dead response at t+1464.8s, while polling every 15s throughout —
-  so it is an absolute expiry, not an idle timeout. 1440 is PHP's default
-  `session.gc_maxlifetime`. Death signature: response still carries a CSRF token but
-  `input[name="broneering[kuupaev]"]` is gone (bounced to the start of the form). **Design should
-  operate on a 20-minute working number**, keeping 1440 as the known ceiling — the margin is cheap
-  and the measurement is from a single embassy on a single day.
+- **F5. SUPERSEDED — see F5-corrected below.** The original finding was: "a session lasts exactly
+  1440 seconds (24 minutes) and activity does not extend it" — established at t+22.0s, first dead
+  response at t+1464.8s while polling every 15s throughout, with 1440 matching PHP's default
+  `session.gc_maxlifetime`. The death signature is still correct: the response carries a CSRF
+  token but `input[name="broneering[kuupaev]"]` is gone (bounced to the start of the form).
+- **F5-corrected (2026-08-02, later the same day). A session expires after roughly 95–100
+  REQUESTS, not after any fixed duration.** Three runs at three cadences: ~98 requests / 1442s
+  polling every 15s; ~95 requests / 138s polling every 2s with date refreshes on top; ~100
+  requests / 189–192s polling every 2s, five consecutive deaths in a single run. Durations differ
+  by more than 10×; request counts do not. **The 1440s figure was an artifact of that one
+  measurement's 15-second polling interval**, and `gc_maxlifetime = 1440` matching it was a
+  coincidence that made a wrong conclusion look well-supported. This is the clearest cautionary
+  tale in this file: one measurement plus a plausible mechanism is not evidence. Practical
+  consequence — polling faster spends the seat's budget faster, so renewal must be driven by
+  request count (`SEAT_RENEW_AFTER_REQUESTS`, default 70), with the time threshold kept only as a
+  secondary backstop. See IMPLEMENTATION_CHANGELOG.md §11 and BOOKER_README.md's "Seat lifetime is
+  a request budget, not a clock".
 - **F6.** Once past the CAPTCHA gate, a date's free-times query needs no CAPTCHA and takes
   195-620ms (median ~490ms over 95 polls). Repeatable indefinitely at zero cost.
 - **F7.** The service dropdown reflects **live inventory**, not a schedule. Proven accidentally:
@@ -677,7 +687,8 @@ the spec.
 - **F9.** Availability arrives in bursts: 2026-07-31 episodes at 05:57, 06:04, 06:30, 06:35, 06:40
   UTC, each ~90-110s, separated by 4-7 minutes. 2026-07-30: 08:02, 11:08, 14:06. Because episodes
   cluster more tightly than a session expires, **one session covers several episodes** — this is
-  what makes the chosen design viable despite F8.
+  what makes the chosen design viable despite F8. (How many, exactly, depends on the poll
+  cadence rather than on elapsed time — see F5-corrected.)
 - **F10.** Slot inventory does not churn on its own: Abu Dhabi held a steady 2 slots across 93
   consecutive polls over 24 minutes. The site does not spontaneously release and re-take slots.
 
