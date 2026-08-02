@@ -12,20 +12,22 @@ URL = 'https://broneering.mfa.ee/en/'
 TARGET = 'Long-stay visa (D-visa) application'
 
 # Global session for connection pooling (added new code by Digvijay)
-_session = None  
-def get_session(): 
-    """Reuse session with connection pooling..."""
+_session = None
+def get_session():
+    """Reuse a single requests.Session across calls in the same process for
+    connection pooling, instead of paying a fresh TLS handshake for every
+    request (site check, then Telegram, then Twilio)."""
     global _session
     if _session is None:
         _session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=2,
             pool_maxsize=2,
-            max_retries=0, 
-        ) 
+            max_retries=0,
+        )
         _session.mount('https://', adapter)
         _session.mount('http://', adapter)
-        return _session
+    return _session
 
 
 def log_line(msg, file=sys.stdout):
@@ -74,7 +76,7 @@ def check_availability():
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Accept': 'text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8',
     }
-    r = s.get(URL, headers=headers, timeout=10)
+    r = s.get(URL, headers=headers, timeout=30)
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, 'lxml')
@@ -102,7 +104,7 @@ def check_availability():
         'broneering[_token]': token,
         'turbo': '',
     }
-    r2 = s.post(action, headers=post_headers, data=data, timeout=10)
+    r2 = s.post(action, headers=post_headers, data=data, timeout=30)
     r2.raise_for_status()
 
     soup2 = BeautifulSoup(r2.text, 'lxml')
@@ -147,7 +149,7 @@ def send_telegram_text(message):
             resp = s.post(
                 f'https://api.telegram.org/bot{token}/sendMessage',
                 data={'chat_id': chat_id, 'text': message},
-                timeout=10,
+                timeout=30,
             )
             resp.raise_for_status()
             sent_count += 1
@@ -238,7 +240,7 @@ def trigger_phone_calls(bypass_cooldown=False):
                 f'https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls.json',
                 auth=(account_sid, auth_token),
                 data={'To': to_number, 'From': from_number, 'Url': twiml_url},
-                timeout=10,
+                timeout=30,
             )
             resp.raise_for_status()
         except Exception as e:
@@ -359,26 +361,18 @@ def main():
         return
 
     try:
-        # One retry for transient network/session blips before treating this
-        # as a real failure worth alerting on.
-       '''try:
-            found, available = check_availability()
-        except Exception as e:
-            log_line(f'First attempt failed ({e}), retrying once...', file=sys.stderr)
-            found, available = check_availability()
-            '''
+        # A couple of retries for transient network/session blips before
+        # treating this as a real failure worth alerting on.
         max_attempts = 2
-        for attempt in range(max_attempts): 
-            try: 
+        for attempt in range(max_attempts):
+            try:
                 found, available = check_availability()
                 break
             except Exception as e:
-                 if attempt == max_attempts - 1:
-                     raise
-                 log_line(f'Attempt {attempt + 1} failed...')
-                 time.sleep(0.5) 
-
-    
+                if attempt == max_attempts - 1:
+                    raise
+                log_line(f'Attempt {attempt + 1} failed ({e}), retrying...', file=sys.stderr)
+                time.sleep(0.5)
     except Exception as exc:
         handle_failure(exc)
         sys.exit(1)  # mark the GitHub Actions run as failed too
