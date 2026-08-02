@@ -109,6 +109,75 @@ if DRY_RUN:
 
 RUNTIME_SIGNATURE = f"\n\n— Sent from {os.environ.get('RUNTIME_LABEL', 'GCP')} booker"
 
+# ---------------------------------------------------------------------------
+# Optional tracing (BOOKER_TRACE=1) - off by default, zero effect when unset
+# ---------------------------------------------------------------------------
+#
+# Two things this captures that ordinary log timestamps can't:
+#
+# 1. Per-step elapsed time from a single t0, so the critical path can be
+#    attributed to specific steps instead of inferred from gaps between
+#    unrelated log lines. Prints both "since start" and "since previous step".
+# 2. Every HTTP request/response the page makes, including POST bodies. This
+#    is the input needed to reimplement the flow as plain `requests` calls
+#    (no browser) - the single biggest available speed win. Capturing it
+#    during a normal dry-run costs nothing and avoids a separate exercise.
+#
+# Deliberately guarded by an env var rather than always-on: the request hook
+# fires on every asset/XHR and would bloat booker.log during real runs.
+
+BOOKER_TRACE = os.environ.get("BOOKER_TRACE", "").lower() in ("1", "true", "yes")
+
+_trace_t0 = time.time()
+_trace_prev = _trace_t0
+
+
+def step(name: str) -> None:
+    """Log elapsed-since-start and elapsed-since-previous-step for a step boundary."""
+    global _trace_prev
+    if not BOOKER_TRACE:
+        return
+    now = time.time()
+    log_line(f"TRACE step={name} t+{now - _trace_t0:6.2f}s (+{now - _trace_prev:5.2f}s since prev)")
+    _trace_prev = now
+
+
+def attach_request_tracing(page) -> None:
+    """
+    Record every request/response with method, URL, status and POST body.
+    POST bodies are what actually matter here - they contain the CSRF token,
+    the form field names, and the step sequencing that a requests-based
+    reimplementation has to reproduce exactly.
+    """
+    if not BOOKER_TRACE:
+        return
+
+    def _on_request(req):
+        # Skip static assets - they're noise and none of them are part of the
+        # form flow that needs reproducing.
+        if req.resource_type in ("image", "stylesheet", "font", "media"):
+            return
+        body = ""
+        try:
+            if req.post_data:
+                body = req.post_data[:1500]
+        except Exception:
+            pass
+        log_line(f"TRACE req t+{time.time() - _trace_t0:6.2f}s {req.method} {req.url}")
+        if body:
+            log_line(f"TRACE   body: {body}")
+
+    def _on_response(resp):
+        try:
+            if resp.request.resource_type in ("image", "stylesheet", "font", "media"):
+                return
+        except Exception:
+            pass
+        log_line(f"TRACE res t+{time.time() - _trace_t0:6.2f}s {resp.status} {resp.url}")
+
+    page.on("request", _on_request)
+    page.on("response", _on_response)
+
 
 # ---------------------------------------------------------------------------
 # Logging / Telegram helpers (mirror the monitor style)
@@ -464,8 +533,18 @@ def get_recaptcha_sitekey(page) -> str | None:
 # Playwright helpers
 # ---------------------------------------------------------------------------
 
+# Dry-runs take ~13 `full_page=True` screenshots, which are genuinely
+# expensive (each forces a full re-render/scroll capture) and are NOT paid on
+# a live run, where screenshot() returns immediately. That makes dry-run wall
+# time systematically slower than the live path it's meant to measure. Set
+# BOOKER_NO_SCREENSHOTS=1 alongside DRY_RUN=1 to get timings representative of
+# a real run; leave it unset when you actually want the screenshots for
+# debugging page markup.
+NO_SCREENSHOTS = os.environ.get("BOOKER_NO_SCREENSHOTS", "").lower() in ("1", "true", "yes")
+
+
 def screenshot(page, name: str) -> None:
-    if not DRY_RUN:
+    if not DRY_RUN or NO_SCREENSHOTS:
         return
     path = SCREENSHOT_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{name}.png"
     page.screenshot(path=str(path), full_page=True)
@@ -679,10 +758,14 @@ def run_booker() -> dict:
             context = browser.new_context(**context_kwargs)
             page = context.new_page()
 
+        attach_request_tracing(page)
+        step("browser_ready")
+
         try:
             # ----- Landing page -----
             log_line("Opening booking page")
             page.goto(URL, wait_until="networkidle", timeout=45000)
+            step("landing_loaded")
             screenshot(page, "01_landing")
 
             # Select embassy + persons
@@ -714,6 +797,7 @@ def run_booker() -> dict:
             except PlaywrightTimeout:
                 log_line("Service dropdown didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
                 wait_settle(page, 2.5)
+            step("service_dropdown_ready")
             screenshot(page, "03_after_turbo")
 
             # Service dropdown
@@ -738,7 +822,9 @@ def run_booker() -> dict:
             screenshot(page, "04_service_selected")
 
             # ----- First reCAPTCHA -----
+            step("reached_captcha1")
             sitekey1, token1 = get_recaptcha_token(page, RECAPTCHA_SITEKEY, prefetch1_thread, prefetch1_result)
+            step("captcha1_token_in_hand")
             inject_recaptcha(page, token1)
             time.sleep(1)
             screenshot(page, "05_captcha1_injected")
@@ -753,6 +839,7 @@ def run_booker() -> dict:
             except PlaywrightTimeout:
                 log_line("Applicant form didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
                 wait_settle(page, 3)
+            step("applicant_form_ready")
             screenshot(page, "06_applicant_page")
 
             # ----- Applicant form -----
@@ -776,6 +863,7 @@ def run_booker() -> dict:
             except PlaywrightTimeout:
                 log_line("Calendar page didn't appear within 8s - falling back to full settle wait", file=sys.stderr)
                 wait_settle(page, 3)
+            step("calendar_page_ready")
             screenshot(page, "08_calendar_page")
 
             if DRY_RUN:
@@ -823,6 +911,7 @@ def run_booker() -> dict:
                 log_line("Stage-2 Telegram sent")
             except Exception as e:
                 log_line(f"Stage-2 Telegram failed: {e}", file=sys.stderr)
+            step("stage2_telegram_sent")
 
             result["available_dates"] = available_dates
             result["stage2_sent"] = True
@@ -839,6 +928,57 @@ def run_booker() -> dict:
                 result["message"] = "Could not choose a date from available list"
                 return result
             log_line(f"Chosen date: {selected_date}")
+
+            # Diagnostic for the leading `no_time_slots` hypothesis: the
+            # manual day-click fallback (used whenever `input._flatpickr` is
+            # missing) only scans `.flatpickr-day` elements in the month
+            # flatpickr currently has rendered - it never navigates months.
+            # Since the date preference is "latest available date", the target
+            # is disproportionately likely to sit in a *future* month, in which
+            # case the fallback either finds nothing (silent no-op, then zero
+            # slots read) or - worse - matches the same day-of-month in the
+            # rendered month and clicks an entirely different date. This logs
+            # the facts needed to confirm or kill that hypothesis outright,
+            # rather than inferring it from the empty result.
+            if BOOKER_TRACE:
+                try:
+                    diag = page.evaluate(
+                        """(dateStr) => {
+                            const input = document.querySelector('input[name="broneering[kuupaev]"]');
+                            const fp = input ? input._flatpickr : null;
+                            const enabled = [];
+                            document.querySelectorAll('.flatpickr-day').forEach(d => {
+                                if (d.classList.contains('prevMonthDay')) return;
+                                if (d.classList.contains('nextMonthDay')) return;
+                                if (d.classList.contains('flatpickr-disabled')) return;
+                                enabled.push(parseInt(d.textContent.trim(), 10));
+                            });
+                            return {
+                                date_input_present: !!input,
+                                flatpickr_api_present: !!fp,
+                                rendered_month: fp ? fp.currentMonth + 1 : null,
+                                rendered_year: fp ? fp.currentYear : null,
+                                target_month: parseInt(dateStr.slice(5, 7), 10),
+                                target_year: parseInt(dateStr.slice(0, 4), 10),
+                                target_day: parseInt(dateStr.slice(8, 10), 10),
+                                enabled_days_in_rendered_month: enabled,
+                            };
+                        }""",
+                        selected_date,
+                    )
+                    log_line(f"TRACE flatpickr_diag: {json.dumps(diag)}")
+                    if diag and not diag.get("flatpickr_api_present"):
+                        same_month = (
+                            diag.get("rendered_month") == diag.get("target_month")
+                            and diag.get("rendered_year") == diag.get("target_year")
+                        )
+                        log_line(
+                            "TRACE flatpickr_diag: API MISSING - fallback day-click will be used. "
+                            f"target month == rendered month: {same_month}. If False, the fallback "
+                            "cannot reach this date and will either no-op or click the wrong day."
+                        )
+                except Exception as e:
+                    log_line(f"TRACE flatpickr_diag failed: {e}", file=sys.stderr)
 
             # Select the day.
             #
@@ -938,6 +1078,37 @@ def run_booker() -> dict:
                         file=sys.stderr,
                     )
                     wait_settle(page, 2)
+                step(f"slot_wait_attempt_{attempt}")
+
+                # Second `no_time_slots` hypothesis: wait_for_selector defaults
+                # to state="visible". Sites routinely hide the real <input
+                # type=checkbox> (opacity/appearance/size zero) and style a
+                # sibling label instead - in which case the elements are
+                # present and readable via evaluate(), but Playwright never
+                # considers them visible, so the wait above times out and burns
+                # the full 5s + fallback settle on every attempt for no reason.
+                # Comparing attached-count against visible-count distinguishes
+                # "never rendered" from "rendered but invisible to Playwright".
+                if BOOKER_TRACE:
+                    try:
+                        counts = page.evaluate(
+                            """() => {
+                                const els = Array.from(
+                                    document.querySelectorAll('input[name="broneering[vastuvotud][]"]')
+                                );
+                                const visible = els.filter(el => {
+                                    const r = el.getBoundingClientRect();
+                                    const s = getComputedStyle(el);
+                                    return r.width > 0 && r.height > 0 &&
+                                           s.visibility !== 'hidden' && s.display !== 'none' &&
+                                           parseFloat(s.opacity) > 0;
+                                });
+                                return { attached: els.length, visible: visible.length };
+                            }"""
+                        )
+                        log_line(f"TRACE checkbox_diag attempt={attempt}: {json.dumps(counts)}")
+                    except Exception as e:
+                        log_line(f"TRACE checkbox_diag failed: {e}", file=sys.stderr)
 
                 # ----- Collect time slots for the chosen date -----
                 # The site's checkbox `value` attribute is an internal slot ID
@@ -1040,10 +1211,13 @@ def run_booker() -> dict:
                 page.wait_for_selector(".g-recaptcha", timeout=2000)
             except PlaywrightTimeout:
                 pass
+            step("reached_captcha2")
             sitekey2, token2 = get_recaptcha_token(page, RECAPTCHA_SITEKEY, prefetch2_thread, prefetch2_result)
+            step("captcha2_token_in_hand")
             inject_recaptcha(page, token2)
             time.sleep(1)
             screenshot(page, "12_captcha2_injected")
+            step("ready_to_submit")
 
             result["selected_date"] = selected_date
             result["selected_time"] = selected_time
@@ -1087,7 +1261,9 @@ def run_booker() -> dict:
                 # last-chance
                 submit = page.locator('button[type="submit"]').last
             submit.first.click()
+            step("submit_clicked")
             wait_settle(page, 4)
+            step("submit_settled")
             screenshot(page, "13_after_submit")
 
             # Heuristic success check
