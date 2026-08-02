@@ -160,7 +160,16 @@ def attach_request_tracing(page) -> None:
         body = ""
         try:
             if req.post_data:
-                body = req.post_data[:1500]
+                # The solved reCAPTCHA token is ~1300 chars and would blow
+                # past any sane truncation limit, taking the fields that
+                # actually matter (`_token`, `edasi`, `turbo`, the form
+                # values) off the end with it. Redact it to its length and
+                # keep everything else intact.
+                body = re.sub(
+                    r"g-recaptcha-response=[^&]*",
+                    lambda m: f"g-recaptcha-response=<TOKEN:{len(m.group(0)) - 22}chars>",
+                    req.post_data,
+                )[:3000]
         except Exception:
             pass
         log_line(f"TRACE req t+{time.time() - _trace_t0:6.2f}s {req.method} {req.url}")
@@ -953,11 +962,30 @@ def run_booker() -> dict:
                                 if (d.classList.contains('flatpickr-disabled')) return;
                                 enabled.push(parseInt(d.textContent.trim(), 10));
                             });
+                            // Read the rendered month from the DOM header rather
+                            // than fp.currentMonth: the whole reason this
+                            // diagnostic exists is the case where `_flatpickr`
+                            // is missing, so anything read off the API is null
+                            // in exactly the situation being investigated.
+                            const monthNames = ["January","February","March","April","May","June",
+                                                "July","August","September","October","November","December"];
+                            const monthEl = document.querySelector('.flatpickr-current-month .cur-month')
+                                         || document.querySelector('.flatpickr-monthDropdown-months');
+                            const yearEl = document.querySelector('.flatpickr-current-month input.cur-year')
+                                        || document.querySelector('.flatpickr-current-month .cur-year');
+                            let domMonth = null;
+                            if (monthEl) {
+                                const txt = (monthEl.value || monthEl.textContent || '').trim();
+                                const idx = monthNames.findIndex(m => txt.indexOf(m) === 0);
+                                domMonth = idx >= 0 ? idx + 1 : (monthEl.selectedIndex >= 0 ? monthEl.selectedIndex + 1 : null);
+                            }
+                            const domYear = yearEl ? parseInt((yearEl.value || yearEl.textContent || '').trim(), 10) : null;
                             return {
                                 date_input_present: !!input,
                                 flatpickr_api_present: !!fp,
-                                rendered_month: fp ? fp.currentMonth + 1 : null,
-                                rendered_year: fp ? fp.currentYear : null,
+                                rendered_month: fp ? fp.currentMonth + 1 : domMonth,
+                                rendered_year: fp ? fp.currentYear : domYear,
+                                rendered_month_source: fp ? "api" : "dom",
                                 target_month: parseInt(dateStr.slice(5, 7), 10),
                                 target_year: parseInt(dateStr.slice(0, 4), 10),
                                 target_day: parseInt(dateStr.slice(8, 10), 10),
@@ -1163,6 +1191,49 @@ def run_booker() -> dict:
                     result["status"] = "no_time_slots"
                     result["message"] = f"No time slots found for {selected_date}"
                     log_line(result["message"], file=sys.stderr)
+
+                    # Dump the actual page state whenever this happens. This
+                    # fires on REAL runs too (not gated on DRY_RUN) because
+                    # `no_time_slots` has only ever occurred on real New Delhi
+                    # triggers, never on a dry-run against an embassy that has
+                    # slots - so a DRY_RUN-only dump would capture exactly the
+                    # cases we don't need and none of the ones we do.
+                    #
+                    # Logging "[]" tells us the checkbox list was empty but not
+                    # WHY: a genuinely sold-out date, a validation error, an
+                    # expired session, a re-presented CAPTCHA, and a silently
+                    # rejected date-selection POST all look identical from the
+                    # checkbox count alone. The raw HTML distinguishes them.
+                    try:
+                        dump_dir = SCRIPT_DIR / "booker_screenshots"
+                        dump_dir.mkdir(parents=True, exist_ok=True)
+                        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        dump_path = dump_dir / f"{stamp}_no_time_slots_{EMBASSY_ID}.html"
+                        dump_path.write_text(page.content(), encoding="utf-8")
+                        log_line(f"no_time_slots page dump: {dump_path}")
+
+                        # Re-read the calendar attribute now, after the empty
+                        # slot read. If the date has vanished from
+                        # `vastuvotukuupaevad` by this point, the list was
+                        # simply a few seconds stale (a race we lost). If it is
+                        # STILL listed as available while returning zero slots,
+                        # the list is structurally optimistic rather than
+                        # merely stale - a different problem with a different
+                        # fix, and the one thing 5/5 identical failures on the
+                        # same date most points toward.
+                        recheck = page.evaluate(
+                            """() => {
+                                const el = document.querySelector('[data-controller="broneering"]');
+                                return el ? el.getAttribute('data-vastuvotukuupaevad') : null;
+                            }"""
+                        )
+                        log_line(f"no_time_slots recheck vastuvotukuupaevad: {recheck}")
+
+                        body_text = page.inner_text("body")
+                        log_line(f"no_time_slots page text (first 800 chars): {body_text[:800]!r}")
+                    except Exception as e:
+                        log_line(f"no_time_slots dump failed: {e}", file=sys.stderr)
+
                     try:
                         send_telegram(
                             f"❌ Slot detected but NOT booked – Estonia D-visa, {EMBASSY_NAME}\n\n"
