@@ -75,11 +75,20 @@ except ImportError:
     HTML_PARSER = "html.parser"
 
 URL = "https://broneering.mfa.ee/en/"
-SERVICE_VALUE = "pikaajaline_viisa"
 RECAPTCHA_SITEKEY = "6Ld04R4nAAAAADJhUQpKyGxGh4zlfOsyk5VkVkzR"
 
 EMBASSY_ID = os.environ.get("EMBASSY_ID", "244")
 EMBASSY_NAME = os.environ.get("EMBASSY_NAME", "Abu Dhabi")
+
+# The question this test asks - "how long does a parked session survive, and
+# does slot inventory churn while we watch?" - is a property of the site's
+# session handling and booking engine, not of the D-visa service specifically.
+# Tying the test to D-visa availability means it can only run during the exact
+# windows we are least able to spare for experiments. AUTO_SERVICE lets it fall
+# back to any other service that has a calendar, so session mechanics can be
+# measured whenever, then applied to D-visa when a real window appears.
+SERVICE_VALUE = os.environ.get("SERVICE_VALUE", "pikaajaline_viisa")
+AUTO_SERVICE = os.environ.get("AUTO_SERVICE", "").lower() in ("1", "true", "yes")
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
 DURATION_SECONDS = int(os.environ.get("DURATION_SECONDS", "3600"))
@@ -189,11 +198,33 @@ def main() -> int:
     r.raise_for_status()
     soup = BeautifulSoup(r.text, HTML_PARSER)
     sel = soup.find("select", {"name": "broneering[toiming]"}) or soup.find("select", {"id": "broneering_toiming"})
-    services = [o.get_text(strip=True) for o in sel.find_all("option")] if sel else []
-    if not any("D-visa" in x for x in services):
-        log(f"STOP: {EMBASSY_NAME} is not currently offering the D-visa service ({services})")
-        log("      Point this at an embassy that is (Abu Dhabi 244 has standing availability).")
-        return 0
+    if not sel:
+        log("FAIL: service dropdown not found")
+        return 1
+
+    # Log value/label pairs, not just labels. The internal values are what the
+    # form actually posts, and having them written down means a service can be
+    # targeted directly next time without another discovery round.
+    options = [
+        (o.get("value", "").strip(), o.get_text(strip=True))
+        for o in sel.find_all("option")
+        if o.get("value", "").strip()
+    ]
+    log(f"Services offered right now ({len(options)}):")
+    for val, label in options:
+        log(f"    {val:<28} {label}")
+
+    service = SERVICE_VALUE
+    if not any(v == service for v, _ in options):
+        if not AUTO_SERVICE:
+            log(f"STOP: {EMBASSY_NAME} is not currently offering '{service}'.")
+            log("      Re-run with AUTO_SERVICE=1 to measure session behaviour using any")
+            log("      available service instead - session mechanics are not service-specific.")
+            return 0
+        service = options[0][0]
+        log(f"AUTO_SERVICE: '{SERVICE_VALUE}' unavailable, falling back to '{service}' "
+            f"({options[0][1]}). Session mechanics still measure correctly; slot churn "
+            f"figures describe this service, not D-visa.")
     token = extract_token(r.text) or token
 
     r = s.post(
@@ -201,7 +232,7 @@ def main() -> int:
         headers=turbo_headers,
         data={
             "broneering[esindus]": EMBASSY_ID,
-            "broneering[toiming]": SERVICE_VALUE,
+            "broneering[toiming]": service,
             "broneering[isikuteArv]": "1",
             "g-recaptcha-response": "",
             "broneering[__dynamic_error]": "",
@@ -219,7 +250,7 @@ def main() -> int:
         headers={**turbo_headers, "Accept": "text/html, application/xhtml+xml"},
         data={
             "broneering[esindus]": EMBASSY_ID,
-            "broneering[toiming]": SERVICE_VALUE,
+            "broneering[toiming]": service,
             "broneering[isikuteArv]": "1",
             "g-recaptcha-response": captcha,
             "broneering[__dynamic_error]": "",
