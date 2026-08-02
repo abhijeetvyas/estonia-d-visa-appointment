@@ -92,6 +92,15 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
+# Same lxml-may-not-be-installed guard as estonia_visa_monitor.py - see the
+# comment there. A probe that dies on a missing optional parser is useless at
+# exactly the moment it is needed.
+try:
+    import lxml  # noqa: F401
+    HTML_PARSER = "lxml"
+except ImportError:
+    HTML_PARSER = "html.parser"
+
 URL = "https://broneering.mfa.ee/en/"
 SERVICE_VALUE = "pikaajaline_viisa"
 RECAPTCHA_SITEKEY = "6Ld04R4nAAAAADJhUQpKyGxGh4zlfOsyk5VkVkzR"
@@ -141,7 +150,7 @@ def extract_token(html: str) -> str | None:
     plain <input name="broneering[_token]"> either way, so one selector
     covers both response shapes.
     """
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, HTML_PARSER)
     inp = soup.find("input", {"name": "broneering[_token]"})
     if inp and inp.get("value"):
         return inp["value"]
@@ -236,7 +245,7 @@ def main() -> int:
         timeout=30,
     )
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
+    soup = BeautifulSoup(r.text, HTML_PARSER)
     sel = soup.find("select", {"name": "broneering[toiming]"}) or soup.find("select", {"id": "broneering_toiming"})
     services = [o.get_text(strip=True) for o in sel.find_all("option")] if sel else []
     token = extract_token(r.text) or token
@@ -292,7 +301,7 @@ def main() -> int:
         timeout=30,
     )
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
+    soup = BeautifulSoup(r.text, HTML_PARSER)
     name_field = soup.find("input", {"name": "broneering[broneeringuIsikud][0][eesnimi]"})
     token = extract_token(r.text) or token
     log(f"step3 edasi (CAPTCHA gate) {r.status_code}  applicant_form={'YES' if name_field else 'NO'}")
@@ -331,7 +340,7 @@ def main() -> int:
             timeout=30,
         )
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, HTML_PARSER)
         name_field = soup.find("input", {"name": "broneering[broneeringuIsikud][0][eesnimi]"})
         token = extract_token(r.text) or token
         log(f"step3 retry with solved CAPTCHA: applicant_form={'YES' if name_field else 'NO'}")
@@ -361,7 +370,7 @@ def main() -> int:
         timeout=30,
     )
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
+    soup = BeautifulSoup(r.text, HTML_PARSER)
     cal = soup.find(attrs={"data-controller": "broneering"})
     token = extract_token(r.text) or token
     log(f"step4 applicant submitted {r.status_code}  calendar={'YES' if cal else 'NO'}")
@@ -372,7 +381,10 @@ def main() -> int:
 
     raw_dates = cal.get("data-vastuvotukuupaevad")
     dates = json.loads(raw_dates) if raw_dates else []
-    log(f"      available dates: {dates}  (etteBron={cal.get('data-etteBron')})")
+    # HTML attribute names are case-insensitive and BeautifulSoup lowercases
+    # them, so the camelCase `data-etteBron` used in the page source is only
+    # reachable as `data-ettebron` here (it read as None before this).
+    log(f"      available dates: {dates}  (etteBron={cal.get('data-ettebron')})")
 
     # ---- Step 5: query time slots for EVERY listed date -----------------
     # The Playwright booker only ever queries the single date its preference
@@ -398,7 +410,7 @@ def main() -> int:
             timeout=30,
         )
         resp.raise_for_status()
-        sp = BeautifulSoup(resp.text, "lxml")
+        sp = BeautifulSoup(resp.text, HTML_PARSER)
         found = []
         for cb in sp.find_all("input", {"name": "broneering[vastuvotud][]"}):
             lab = sp.find("label", {"for": cb.get("id")}) if cb.get("id") else None
@@ -464,7 +476,7 @@ def main() -> int:
             timeout=30,
         )
         resp.raise_for_status()
-        sp = BeautifulSoup(resp.text, "lxml")
+        sp = BeautifulSoup(resp.text, HTML_PARSER)
         text = sp.get_text(" ", strip=True)
         ok = ("Booked time" in text) or ("Add new booking" in text) or (
             datetime.strptime(target_date, "%Y-%m-%d").strftime("%d.%m.%Y") in text
@@ -522,13 +534,32 @@ def main() -> int:
 
     deleted = False
     try:
+        # Links take priority over forms. Observed on the real confirmation
+        # page (2026-08-02): the delete action is a plain link,
+        # `<a href="/en/delete?id=...">Delete</a>`, which sits INSIDE the
+        # page's only <form>. Matching forms first therefore matched that
+        # wrapper form - whose action is empty and whose only field is the
+        # CSRF token - and POSTed a no-op back to the booking page, leaving a
+        # real test booking live on the portal. Check for the explicit link
+        # first; fall back to form-matching only when there isn't one.
         target_form = None
-        for f in forms:
-            blob = (f.get_text(" ", strip=True) + " " + str(f.get("action") or "")).lower()
-            if any(w in blob for w in ("delete", "cancel", "kustuta", "tuhista")):
-                target_form = f
-                break
-        if target_form is not None:
+        if not links:
+            for f in forms:
+                blob = (f.get_text(" ", strip=True) + " " + str(f.get("action") or "")).lower()
+                if any(w in blob for w in ("delete", "cancel", "kustuta", "tuhista")):
+                    target_form = f
+                    break
+        if links:
+            href = links[0][1]
+            if href and href.startswith("/"):
+                href = "https://broneering.mfa.ee" + href
+            log(f"step7 following delete link -> {href}")
+            dr = s.get(href, timeout=30)
+            dr.raise_for_status()
+            dtext = BeautifulSoup(dr.text, HTML_PARSER).get_text(" ", strip=True)
+            deleted = "Booked time" not in dtext
+            log(f"step7 delete response {dr.status_code}  deleted={deleted}  dump: {dump('step7_after_delete', dr.text)}")
+        elif target_form is not None:
             payload = {}
             for i_ in target_form.find_all("input"):
                 if i_.get("name"):
@@ -542,17 +573,7 @@ def main() -> int:
             log(f"step7 submitting delete form -> {action} fields={list(payload)}")
             dr = s.post(action, headers=turbo_headers, data=payload, timeout=30)
             dr.raise_for_status()
-            dtext = BeautifulSoup(dr.text, "lxml").get_text(" ", strip=True)
-            deleted = "Booked time" not in dtext
-            log(f"step7 delete response {dr.status_code}  deleted={deleted}  dump: {dump('step7_after_delete', dr.text)}")
-        elif links:
-            href = links[0][1]
-            if href and href.startswith("/"):
-                href = "https://broneering.mfa.ee" + href
-            log(f"step7 following delete link -> {href}")
-            dr = s.get(href, timeout=30)
-            dr.raise_for_status()
-            dtext = BeautifulSoup(dr.text, "lxml").get_text(" ", strip=True)
+            dtext = BeautifulSoup(dr.text, HTML_PARSER).get_text(" ", strip=True)
             deleted = "Booked time" not in dtext
             log(f"step7 delete response {dr.status_code}  deleted={deleted}  dump: {dump('step7_after_delete', dr.text)}")
         else:

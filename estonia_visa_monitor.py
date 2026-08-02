@@ -30,6 +30,29 @@ def get_session():
     return _session
 
 
+# BeautifulSoup's 'lxml' parser needs the `lxml` package installed. It is
+# listed in requirements.txt, but the VM's venv was created before that line
+# existed - so a `git pull` of the lxml-using code onto a venv that never had
+# `pip install -r requirements.txt` re-run against it takes the monitor down
+# on EVERY cron tick with bs4's FeatureNotFound. That happened on 2026-08-02.
+#
+# lxml is a speed optimization worth maybe a few milliseconds on a page this
+# size; the monitor's entire job is to not be down. Falling back to Python's
+# built-in parser keeps a missing optional dependency from being an outage,
+# rather than making correct operation depend on someone remembering to run
+# pip after a pull.
+try:
+    import lxml  # noqa: F401
+    HTML_PARSER = 'lxml'
+except ImportError:
+    HTML_PARSER = 'html.parser'
+    print(
+        "lxml not installed - falling back to html.parser "
+        "(run: venv/bin/pip install lxml)",
+        file=sys.stderr,
+    )
+
+
 def log_line(msg, file=sys.stdout):
     """Prints with an ISO timestamp prefix so log entries can be correlated
     with actual wall-clock time (monitor.log had no timestamps before this,
@@ -79,7 +102,7 @@ def check_availability():
     r = s.get(URL, headers=headers, timeout=30)
     r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, 'lxml')
+    soup = BeautifulSoup(r.text, HTML_PARSER)
     token_inp = soup.find('input', {'name': 'broneering[_token]'})
     if not token_inp:
         raise RuntimeError('CSRF token not found on landing page — site markup may have changed')
@@ -107,7 +130,7 @@ def check_availability():
     r2 = s.post(action, headers=post_headers, data=data, timeout=30)
     r2.raise_for_status()
 
-    soup2 = BeautifulSoup(r2.text, 'lxml')
+    soup2 = BeautifulSoup(r2.text, HTML_PARSER)
     sel = soup2.find('select', {'name': 'broneering[toiming]'}) or soup2.find('select', {'id': 'broneering_toiming'})
     if not sel:
         raise RuntimeError('Service dropdown not found in step-2 response — site markup may have changed')
