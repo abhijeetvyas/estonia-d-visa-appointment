@@ -574,7 +574,30 @@ def choose_time(time_labels: list[str]) -> Optional[str]:
 class TokenReserve:
     """Keeps one freshly-solved CAPTCHA token available while a seat is live.
     CapSolver only (R30) - see the module-level comment above for why `race`
-    is deliberately excluded here."""
+    is deliberately excluded here.
+
+    Round-4 Fix 11/12: this class now supports two additional, EVENT-DRIVEN
+    ways a solve can start, on top of the original periodic
+    TOKEN_REFRESH_SECONDS loop:
+
+      - `prewarm()` (Fix 11): kicks a solve off immediately, in parallel
+        with whatever else is happening (specifically, the acquisition's or
+        renewal's own CAPTCHA solve) - see SeatManager.acquire()/
+        begin_overlapping_reacquire(). Previously `start()` was only called
+        AFTER a seat was fully established, so the reserve's first token
+        didn't even start solving until ~20s after the trigger - by which
+        time a booking attempt needing it was often already underway. See
+        IMPLEMENTATION_CHANGELOG.md §10 for the live timing that exposed
+        this (seat acquired 17:35:42, reserve's first token only landed
+        17:35:59).
+      - an immediate re-solve triggered from `take()` (Fix 12): previously
+        the reserve sat empty for up to TOKEN_REFRESH_SECONDS (75s) after
+        every single-use `take()`, instead of refilling right away.
+
+    `_resolve_in_progress` guards against two solves running concurrently
+    (e.g. the periodic loop and an event-driven trigger firing at the same
+    moment) - solves cost real money (F3/§7), so this is a dedupe, not a
+    correctness requirement."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -582,6 +605,7 @@ class TokenReserve:
         self._token_ts: float = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._resolve_in_progress = False
 
     def start(self) -> None:
         self._stop.clear()
@@ -595,37 +619,84 @@ class TokenReserve:
         with self._lock:
             self._token = None
             self._token_ts = 0.0
+            self._resolve_in_progress = False
+
+    def prewarm(self) -> None:
+        """Fix 11: kick off a solve RIGHT NOW, in the background, without
+        waiting for `start()`'s periodic loop. Safe to call even before
+        `start()` (as SeatManager.acquire() now does, concurrently with its
+        own acquisition CAPTCHA solve) and safe to call repeatedly -
+        `_solve_and_store()`'s own `_resolve_in_progress` guard means only
+        one solve actually runs at a time no matter how many callers ask."""
+        if self._stop.is_set():
+            return
+        threading.Thread(target=self._solve_and_store, kwargs={"reason": "prewarm"}, daemon=True).start()
+
+    def _has_fresh_token(self) -> bool:
+        with self._lock:
+            return self._token is not None and (time.time() - self._token_ts) <= TOKEN_MAX_AGE_SECONDS
+
+    def _solve_and_store(self, reason: str) -> None:
+        with self._lock:
+            if self._resolve_in_progress:
+                return  # a solve (periodic, prewarm, or post-take) is already in flight
+            self._resolve_in_progress = True
+        try:
+            token = solve_capsolver()
+            with self._lock:
+                self._token = token
+                self._token_ts = time.time()
+            log_line("TOKEN_REFRESHED", f"reserve token refreshed (reason={reason})")
+        except RateLimitExceeded:
+            pass  # already alerted by the rate limiter itself
+        except Exception as e:
+            log_line("INFO", f"Token reserve refresh failed (reason={reason}, will retry): {e}")
+        finally:
+            with self._lock:
+                self._resolve_in_progress = False
 
     def _run(self) -> None:
+        first_iteration = True
         while not self._stop.is_set():
-            try:
-                token = solve_capsolver()
-                with self._lock:
-                    self._token = token
-                    self._token_ts = time.time()
-                log_line("TOKEN_REFRESHED", "reserve token refreshed")
-            except RateLimitExceeded:
-                pass  # already alerted by the rate limiter itself
-            except Exception as e:
-                log_line("INFO", f"Token reserve refresh failed (will retry): {e}")
+            # Fix 11: if a prewarmed token is already sitting there fresh
+            # (started concurrently with acquisition, before this periodic
+            # loop even started), don't immediately burn a second, redundant
+            # solve on this very first pass - just start the normal
+            # TOKEN_REFRESH_SECONDS cadence from here.
+            if first_iteration and self._has_fresh_token():
+                first_iteration = False
+                self._stop.wait(TOKEN_REFRESH_SECONDS)
+                continue
+            first_iteration = False
+            self._solve_and_store(reason="periodic")
             # Wait TOKEN_REFRESH_SECONDS, but wake immediately on stop().
             self._stop.wait(TOKEN_REFRESH_SECONDS)
 
     def take(self) -> Optional[str]:
         """Returns a still-fresh token and clears it (single-use), or None if
         empty/stale (R29). Caller (booking path, R23) must solve on demand
-        if this returns None."""
+        if this returns None. Fix 12: either way (a valid token consumed, or
+        a stale one discarded), the reserve is now empty - kick an immediate
+        background re-solve instead of waiting for the next periodic
+        TOKEN_REFRESH_SECONDS tick (up to 75s away). The periodic loop in
+        `_run()` keeps running as the steady-state mechanism regardless;
+        this is an additional, faster-recovery trigger, not a replacement."""
         with self._lock:
+            had_token = self._token is not None
             if self._token is None:
-                return None
-            age = time.time() - self._token_ts
-            if age > TOKEN_MAX_AGE_SECONDS:
-                log_line("TOKEN_STALE", f"reserve token discarded, age={age:.0f}s > {TOKEN_MAX_AGE_SECONDS}s")
-                self._token = None
-                return None
-            token = self._token
-            self._token = None
-            return token
+                result = None
+            else:
+                age = time.time() - self._token_ts
+                if age > TOKEN_MAX_AGE_SECONDS:
+                    log_line("TOKEN_STALE", f"reserve token discarded, age={age:.0f}s > {TOKEN_MAX_AGE_SECONDS}s")
+                    self._token = None
+                    result = None
+                else:
+                    result = self._token
+                    self._token = None
+        if had_token:
+            threading.Thread(target=self._solve_and_store, kwargs={"reason": "post-take"}, daemon=True).start()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +727,23 @@ class SeatManager:
         # not a per-seat property, so it must survive seat swaps.
         self.last_reacquire_ts: float = 0.0
 
+        # Round-4 follow-up state (Fixes 13/14).
+        # Fix 13: at most one booking attempt (on-demand solve + eventual
+        # submit) in flight at a time - guards against poll_cycle() finding
+        # the same or another slot again before a previous background
+        # booking attempt has finished.
+        self.booking_lock = threading.Lock()
+        self.booking_in_progress: bool = False
+        # Fix 13: serializes every HTTP call that touches this seat's live
+        # session (free-times queries, R17 date-list refreshes, and the
+        # final submit) so a backgrounded on-demand-solve-then-submit can
+        # never interleave with a concurrent free-times query on the SAME
+        # session (R16's "concurrent queries may corrupt session state" -
+        # the CAPTCHA solve itself touches no session state at all and so
+        # deliberately runs OUTSIDE this lock; only the brief final submit
+        # needs it).
+        self.session_lock = threading.Lock()
+
     def has_live_seat(self) -> bool:
         return self.seat is not None and self.seat.alive
 
@@ -665,6 +753,21 @@ class SeatManager:
         and Telegrammed per the failure-mode table (spec §8)."""
         log_line("SEAT_ACQUIRING", f"embassy={EMBASSY_ID}/{EMBASSY_NAME}", elapsed_since_trigger)
         try:
+            # Fix 11 (CRITICAL): start the reserve's first solve THE SAME
+            # MOMENT this acquisition begins, running in parallel with the
+            # acquisition's own CAPTCHA solve below - not after the seat is
+            # established, which is what left the reserve cold at exactly
+            # the moment the very first booking attempt needed it (see
+            # IMPLEMENTATION_CHANGELOG.md §10 for the live timing that
+            # exposed this). This is safe to do unconditionally and this
+            # early: solve_capsolver() only needs the sitekey + page URL
+            # (F4) and has no dependency on the session/seat being
+            # established, unlike the still-open R9 concurrency question
+            # (§3, round 1) which is specifically about threading the
+            # ACQUISITION's own CAPTCHA solve together with session-dependent
+            # HTTP steps.
+            self.token_reserve.prewarm()
+
             session = http_flow.new_session()
             has_dvisa, services, _ = check_service_offered(session, EMBASSY_ID)
             if not has_dvisa:
@@ -752,6 +855,15 @@ class SeatManager:
                     "SEAT_RENEWING",
                     f"reason={reason} old_seat_age={self.seat.age_seconds():.0f}s" if self.seat else f"reason={reason}",
                 )
+                # Fix 11: applies here too, per round 4's instructions - a
+                # swapped-in seat should also arrive with a warm reserve
+                # rather than relying solely on whatever the (shared,
+                # continuously-running) reserve happens to already hold.
+                # Harmless/free if the reserve is already mid-solve or
+                # already holds a fresh token - _solve_and_store()'s
+                # _resolve_in_progress guard dedupes, and _has_fresh_token()
+                # is checked before any redundant periodic solve too.
+                self.token_reserve.prewarm()
                 session = http_flow.new_session()
                 has_dvisa, services, _ = check_service_offered(session, EMBASSY_ID)
                 if not has_dvisa:
@@ -857,15 +969,49 @@ def self_detect_once() -> Optional[dict]:
 # Booking attempt (R19-R26)
 # ---------------------------------------------------------------------------
 
+# Round-4 Fix 14: DAEMON_DRY_RUN=1 must attempt a booking only once. Abu
+# Dhabi-style standing availability means every poll cycle finds a slot, so
+# without this the daemon re-ran the ENTIRE booking path - including an
+# on-demand CAPTCHA solve whenever the reserve happened to be empty - on
+# every single cycle forever (~12 solves observed in a 5-minute dry run).
+# Module-level (not per-SeatManager) because DAEMON_DRY_RUN is a whole-process
+# mode, not a per-seat property, and must stay set across any seat swap.
+_dry_run_completed = threading.Event()
+
+
 def attempt_booking(seat_mgr: SeatManager, date_iso: str, slot: Slot, elapsed_since_trigger: Optional[float]) -> bool:
     """Returns True if the daemon should stop all further booking attempts
-    (i.e. a confirmed booking happened). R25: check the booked flag right
-    before every submit, not just at startup - a race against the old
-    Playwright booker or a human is possible and this is the last line of
-    defence against double-booking."""
+    (i.e. a confirmed booking happened, checked via the persistent flag on
+    the NEXT poll_cycle() call - see below re: Fix 13's async path). R25:
+    check the booked flag right before every submit, not just at startup - a
+    race against the old Playwright booker or a human is possible and this
+    is the last line of defence against double-booking."""
     if is_already_booked():
         log_line("INFO", "Already booked (flag set) - skipping submit despite a found slot")
         return True
+
+    if DAEMON_DRY_RUN and _dry_run_completed.is_set():
+        # Fix 14: one full dry-run pass (through to "would have booked",
+        # inside _finish_booking below) has already happened. Keep polling
+        # and logging POLL_RESULT/SLOT_FOUND normally (unaffected - this
+        # function just isn't called with any further effect) but spend no
+        # more CAPTCHA solves or Telegram noise on it.
+        return False
+
+    with seat_mgr.booking_lock:
+        if seat_mgr.booking_in_progress:
+            # Fix 13: a previous booking attempt (on-demand solve and/or the
+            # eventual submit) is still in flight in the background. Do not
+            # dispatch a second, concurrent one - "keep the booking attempt
+            # itself sequential and correct" per round 4's instructions.
+            log_line(
+                "INFO",
+                "A booking attempt is already in flight for this seat - not starting a second one "
+                "(will be tried again next poll cycle if it fails)",
+                elapsed_since_trigger,
+            )
+            return False
+        seat_mgr.booking_in_progress = True
 
     log_line(
         "BOOKING_ATTEMPT",
@@ -876,68 +1022,132 @@ def attempt_booking(seat_mgr: SeatManager, date_iso: str, slot: Slot, elapsed_si
     seat = seat_mgr.seat
     if seat is None or not seat.alive:
         log_line("BOOKING_FAILED", "no live seat at submit time", elapsed_since_trigger)
+        with seat_mgr.booking_lock:
+            seat_mgr.booking_in_progress = False
         return False
 
-    # R23: use the reserve; if empty/stale, solve on demand and log loudly.
+    # R23: use the reserve; if empty/stale, solve on demand.
     captcha_token = seat_mgr.token_reserve.take()
-    if captcha_token is None:
-        log_line("INFO", "Token reserve empty/stale at booking time - solving on demand (this costs the full ~15-25s)")
+    if captcha_token is not None:
+        # Fast path - Fix 11 makes this the common case now. Proceed
+        # synchronously, exactly as before Fix 13.
+        return _finish_booking(seat_mgr, date_iso, slot, captcha_token, elapsed_since_trigger)
+
+    # Fix 13: the reserve was empty/stale. Previously `solve_on_demand()` ran
+    # right here, blocking the ENTIRE main loop (trigger detection, other
+    # dates' polling, everything) for the full ~15-25s solve - observed
+    # directly as a total gap in POLL_RESULT lines (17:38:33 -> 17:38:53, see
+    # IMPLEMENTATION_CHANGELOG.md §10). The solve itself touches no session
+    # state at all (F4 - CapSolver only needs the sitekey + page URL), so it
+    # is safe to run off the main thread; only the eventual submit (inside
+    # _finish_booking) needs to be serialized against a concurrent
+    # free-times query on the SAME session (R16), via seat_mgr.session_lock.
+    log_line(
+        "INFO",
+        "Token reserve empty/stale at booking time - solving on demand in the background so polling "
+        "continues (Fix 13; still costs ~15-25s, but no longer stalls the poll loop)",
+        elapsed_since_trigger,
+    )
+
+    def _background_solve_and_finish():
         try:
-            captcha_token = solve_on_demand()
+            token = solve_on_demand()
         except Exception as e:
             log_line("BOOKING_FAILED", f"on-demand CAPTCHA solve failed: {e}", elapsed_since_trigger)
             send_telegram(
                 f"❌ Slot found for {EMBASSY_NAME} on {date_iso} {slot.time} but the booking "
                 f"CAPTCHA could not be solved: {e}\nCheck the portal manually.{RUNTIME_SIGNATURE}"
             )
+            with seat_mgr.booking_lock:
+                seat_mgr.booking_in_progress = False
+            return
+        _finish_booking(seat_mgr, date_iso, slot, token, elapsed_since_trigger)
+
+    threading.Thread(target=_background_solve_and_finish, daemon=True).start()
+    # Not confirmed synchronously. poll_cycle() treats False as "try the next
+    # date this cycle" (R22) / "try again next cycle" - the persistent
+    # booked-flag check at the top of poll_cycle()/attempt_booking() is what
+    # actually stops further attempts once _finish_booking confirms a
+    # booking asynchronously (within one SLOT_POLL_INTERVAL_SECONDS of it
+    # happening - the existing R25 check, unchanged).
+    return False
+
+
+def _finish_booking(seat_mgr: SeatManager, date_iso: str, slot: Slot, captcha_token: str, elapsed_since_trigger: Optional[float]) -> bool:
+    """The part of a booking attempt that needs an actual CAPTCHA token in
+    hand: the DAEMON_DRY_RUN stop-before-submit branch (R26/Fix 14), or the
+    real submit (R19-R25). Always clears seat_mgr.booking_in_progress on the
+    way out (Fix 13), whether called synchronously (reserve had a token) or
+    from the Fix-13 background thread (reserve was empty)."""
+    try:
+        if is_already_booked():
+            # Re-check: a solve can take ~15-25s, during which another path
+            # (the old Playwright booker, a human, or - Fix 13 - a second
+            # attempt this one raced against, though booking_in_progress
+            # should have prevented that) may have already booked.
+            log_line("INFO", "Booked elsewhere while solving/waiting for a token - skipping this submit")
+            return True
+
+        if DAEMON_DRY_RUN:
+            # R26: run everything up to but not including the real submit.
+            log_line(
+                "BOOKING_ATTEMPT",
+                f"DAEMON_DRY_RUN=1 - stopping before submit. Would have booked date={date_iso} time={slot.time} slot_id={slot.value}",
+                elapsed_since_trigger,
+            )
+            send_telegram(
+                f"🧪 DRY RUN: would have booked D-visa at {EMBASSY_NAME} for {date_iso} {slot.time} "
+                f"(slot {slot.value}). No real submit was made.{RUNTIME_SIGNATURE}"
+            )
+            _dry_run_completed.set()  # Fix 14: no further booking attempts for the rest of this run
             return False
 
-    if DAEMON_DRY_RUN:
-        # R26: run everything up to but not including the real submit.
-        log_line(
-            "BOOKING_ATTEMPT",
-            f"DAEMON_DRY_RUN=1 - stopping before submit. Would have booked date={date_iso} time={slot.time} slot_id={slot.value}",
-            elapsed_since_trigger,
-        )
-        send_telegram(
-            f"🧪 DRY RUN: would have booked D-visa at {EMBASSY_NAME} for {date_iso} {slot.time} "
-            f"(slot {slot.value}). No real submit was made.{RUNTIME_SIGNATURE}"
-        )
-        return False
+        seat = seat_mgr.seat
+        if seat is None or not seat.alive:
+            log_line("BOOKING_FAILED", "no live seat at submit time (died while solving/waiting for a token)", elapsed_since_trigger)
+            return False
 
-    try:
-        applicant = load_applicant_data()
-        confirmed, response_html = submit_booking(
-            seat, date_iso, slot.value, captcha_token, notes=applicant.get("specifying_information", "")
-        )
-    except SeatDeadError:
-        log_line("BOOKING_FAILED", "seat died during submit", elapsed_since_trigger)
-        seat_mgr.drop_seat()
-        return False
-    except Exception as e:
-        log_line("BOOKING_FAILED", f"submit request failed: {e}", elapsed_since_trigger)
-        return False
+        try:
+            applicant = load_applicant_data()
+            # Fix 13: the only line in this whole function that actually
+            # touches the seat's live session - held only for this one
+            # request, so a concurrent free-times query (R16) waits at most
+            # a sub-second beat, never the full CAPTCHA-solve duration.
+            with seat_mgr.session_lock:
+                confirmed, response_html = submit_booking(
+                    seat, date_iso, slot.value, captcha_token, notes=applicant.get("specifying_information", "")
+                )
+        except SeatDeadError:
+            log_line("BOOKING_FAILED", "seat died during submit", elapsed_since_trigger)
+            seat_mgr.drop_seat()
+            return False
+        except Exception as e:
+            log_line("BOOKING_FAILED", f"submit request failed: {e}", elapsed_since_trigger)
+            return False
 
-    if confirmed:
-        details = {"date": date_iso, "time": slot.time, "slot_id": slot.value, "embassy": EMBASSY_ID}
-        mark_booked(details)
-        send_telegram(
-            f"✅ BOOKED D-visa appointment for {EMBASSY_NAME}: {date_iso} at {slot.time}. "
-            f"~{elapsed_since_trigger:.1f}s from slot detection to submit.{RUNTIME_SIGNATURE}"
-        )
-        return True
-    else:
-        # Spec §8: "Booking submitted, confirmation unclear -> Do NOT set the
-        # booked flag. Telegram a warning telling the owner to check the
-        # portal manually." Never silently swallow an unclear outcome.
-        dump_path = dump_html(f"booking_unclear_{EMBASSY_ID}", response_html)
-        log_line("BOOKING_FAILED", f"submit response did not confirm success - dump: {dump_path}", elapsed_since_trigger)
-        send_telegram(
-            f"⚠️ Submitted a booking for {EMBASSY_NAME} ({date_iso} {slot.time}) but could not confirm "
-            f"success from the response. CHECK THE PORTAL MANUALLY - it may or may not have gone "
-            f"through. (booked flag NOT set){RUNTIME_SIGNATURE}"
-        )
-        return False
+        if confirmed:
+            details = {"date": date_iso, "time": slot.time, "slot_id": slot.value, "embassy": EMBASSY_ID}
+            mark_booked(details)
+            send_telegram(
+                f"✅ BOOKED D-visa appointment for {EMBASSY_NAME}: {date_iso} at {slot.time}. "
+                f"~{elapsed_since_trigger:.1f}s from slot detection to submit.{RUNTIME_SIGNATURE}"
+            )
+            return True
+        else:
+            # Spec §8: "Booking submitted, confirmation unclear -> Do NOT set
+            # the booked flag. Telegram a warning telling the owner to check
+            # the portal manually." Never silently swallow an unclear outcome.
+            dump_path = dump_html(f"booking_unclear_{EMBASSY_ID}", response_html)
+            log_line("BOOKING_FAILED", f"submit response did not confirm success - dump: {dump_path}", elapsed_since_trigger)
+            send_telegram(
+                f"⚠️ Submitted a booking for {EMBASSY_NAME} ({date_iso} {slot.time}) but could not confirm "
+                f"success from the response. CHECK THE PORTAL MANUALLY - it may or may not have gone "
+                f"through. (booked flag NOT set){RUNTIME_SIGNATURE}"
+            )
+            return False
+    finally:
+        with seat_mgr.booking_lock:
+            seat_mgr.booking_in_progress = False
 
 
 # ---------------------------------------------------------------------------
@@ -988,7 +1198,10 @@ def maybe_refresh_dates(seat_mgr: SeatManager, forced: bool, elapsed_since_trigg
 
     q0 = time.time()
     try:
-        new_dates = resolve_r17_refresh_dates(seat)
+        # Fix 13: serialize against a concurrent booking submit on the same
+        # session (R16) - see seat_mgr.session_lock's definition.
+        with seat_mgr.session_lock:
+            new_dates = resolve_r17_refresh_dates(seat)
     except SeatDeadError:
         log_line("SEAT_DIED", "detected during R17 date-list refresh", elapsed_since_trigger)
         seat_mgr.drop_seat()
@@ -1142,7 +1355,14 @@ def poll_cycle(seat_mgr: SeatManager, elapsed_since_trigger: Optional[float]) ->
     for date_iso in rank_dates(seat.available_dates):
         q0 = time.time()
         try:
-            slots = query_free_times(seat, date_iso)
+            # Fix 13: serialize against a concurrent booking submit on the
+            # same session (R16) - see seat_mgr.session_lock's definition.
+            # This is the only new source of contention Fix 13 introduces:
+            # if a background booking submit is mid-flight, this query waits
+            # for that single, sub-second HTTP call to finish, not the whole
+            # ~15-25s CAPTCHA solve that used to precede it.
+            with seat_mgr.session_lock:
+                slots = query_free_times(seat, date_iso)
         except SeatDeadError:
             log_line("SEAT_DIED", f"detected while querying {date_iso}", elapsed_since_trigger)
             seat_mgr.drop_seat()
@@ -1187,6 +1407,38 @@ def poll_cycle(seat_mgr: SeatManager, elapsed_since_trigger: Optional[float]) ->
 
 
 # ---------------------------------------------------------------------------
+# Round-4 Fix 15 (minor): episode-based elapsed_since_trigger
+# ---------------------------------------------------------------------------
+
+def update_episode_start(episode_start_ts: Optional[float], previous_last_trigger_ts: float, new_trigger_ts: float) -> float:
+    """Every `elapsed_since_trigger` logged throughout this file used to be
+    computed against the MOST RECENT trigger-file timestamp. But the monitor
+    hook writes a fresh trigger on every ~10s detection tick for an entire
+    ~90-110s episode (not once per episode - see IMPLEMENTATION_CHANGELOG.md
+    §9), so "elapsed since the latest trigger" reset to ~0.00s on every one
+    of those re-announcements - it was measuring time since the last
+    re-announcement, not since the episode (and therefore the real
+    opportunity to book) began. Since round 4's whole point is judging real
+    end-to-end latency (Fix 11's ~21s cold-path target), this number has to
+    mean what it says.
+
+    A new episode is defined the same way Fix 7 already defines "no longer
+    fresh": a gap of more than TRIGGER_FRESH_WINDOW_SECONDS with no trigger
+    at all. Reusing that existing constant rather than adding a new one -
+    the two concepts (is a trigger still fresh enough to corroborate
+    inventory, is this a new episode) are naturally the same threshold.
+
+    Returns the episode-start timestamp to use from here on: unchanged if
+    this trigger continues an episode already in progress, or reset to
+    `new_trigger_ts` if this is the first trigger of a new one.
+    """
+    is_new_episode = (previous_last_trigger_ts <= 0) or ((new_trigger_ts - previous_last_trigger_ts) > TRIGGER_FRESH_WINDOW_SECONDS)
+    if is_new_episode or episode_start_ts is None:
+        return new_trigger_ts
+    return episode_start_ts
+
+
+# ---------------------------------------------------------------------------
 # Main daemon loop
 # ---------------------------------------------------------------------------
 
@@ -1219,7 +1471,8 @@ def main() -> int:
     seat_mgr = SeatManager()
     trigger_watcher = TriggerWatcher()
 
-    trigger_ts: Optional[float] = None  # for elapsed-since-trigger logging
+    trigger_ts: Optional[float] = None  # latest trigger seen (Fix 7's freshness checks use seat_mgr.last_trigger_ts, same value)
+    episode_start_ts: Optional[float] = None  # Fix 15: first trigger of the CURRENT episode - see update_episode_start()
     last_self_detect = 0.0
     last_balance_check = 0.0
     consecutive_errors = 0
@@ -1238,8 +1491,14 @@ def main() -> int:
                         trigger_watcher.last_seen_ts = self_trigger["ts"]
 
                 if trigger is not None:
-                    trigger_ts = trigger["ts"]
-                    elapsed = time.time() - trigger_ts
+                    new_trigger_ts = trigger["ts"]
+                    # Fix 15: figure out episode boundaries BEFORE
+                    # overwriting seat_mgr.last_trigger_ts below - a "new
+                    # episode" is judged against the PREVIOUS latest trigger,
+                    # not this one.
+                    episode_start_ts = update_episode_start(episode_start_ts, seat_mgr.last_trigger_ts, new_trigger_ts)
+                    trigger_ts = new_trigger_ts
+                    elapsed = time.time() - episode_start_ts
                     log_line("TRIGGER_RECEIVED", f"services={trigger.get('services')}", elapsed)
                     # Fix 7: record that a trigger was just seen, regardless
                     # of seat state - this is the "inventory exists right
@@ -1247,8 +1506,11 @@ def main() -> int:
                     # check_suspect_and_maybe_reacquire() checks freshness
                     # against. Uses the trigger's own timestamp (when the
                     # monitor actually detected availability), not the time
-                    # the daemon happened to notice the file.
-                    seat_mgr.last_trigger_ts = trigger_ts
+                    # the daemon happened to notice the file. Deliberately
+                    # the LATEST trigger, not the episode start (Fix 15) -
+                    # freshness and "how long has this episode been running"
+                    # are different questions.
+                    seat_mgr.last_trigger_ts = new_trigger_ts
                     if not seat_mgr.has_live_seat() and not is_already_booked():
                         seat_mgr.acquire(elapsed_since_trigger=elapsed)
                     elif seat_mgr.has_live_seat() and not is_already_booked():
@@ -1288,7 +1550,9 @@ def main() -> int:
                     now = time.time()
                     if (now - seat_mgr.last_slot_poll_ts) >= SLOT_POLL_INTERVAL_SECONDS:
                         seat_mgr.last_slot_poll_ts = now
-                        elapsed = (time.time() - trigger_ts) if trigger_ts else None
+                        # Fix 15: episode-based, not latest-trigger-based -
+                        # see update_episode_start()'s docstring.
+                        elapsed = (time.time() - episode_start_ts) if episode_start_ts is not None else None
                         booked_now = poll_cycle(seat_mgr, elapsed)
                         if booked_now:
                             log_line("INFO", "Booking confirmed - continuing to monitor, but no further booking attempts will be made")

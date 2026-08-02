@@ -542,3 +542,188 @@ No deviations from the four fixes as specified - Fix 7's condition, Fix 8's debo
 1. **Resetting `empty_poll_streak` on `REACQUIRE_SUPPRESSED` could mask a persistent problem recurring within one cooldown window.** If R17's refresh mechanism is genuinely broken (round 1 §4/§7's still-open item) and stays broken for the full 300s `REACQUIRE_COOLDOWN_SECONDS`, the counter has to climb back up to `SUSPECT_AFTER_EMPTY_POLLS=5` from zero each time before `REACQUIRE_SUPPRESSED` logs again, rather than logging continuously. This means `daemon.log` would show `REACQUIRE_SUPPRESSED` roughly once per `5 × SLOT_POLL_INTERVAL_SECONDS` (~10s) during a genuinely-broken stretch, not once per poll - which seems like reasonable log hygiene, but it does mean the log undercounts exactly how bad the underlying breakage is during the cooldown. An operator watching for R17 health should look at frequency of `DATE_REFRESH_SUSPECT`/`REACQUIRE_SUPPRESSED` pairs across cooldown windows, not raw poll-level detail.
 2. **The defaults (`SUSPECT_AFTER_EMPTY_POLLS=5` at 2s cadence ≈ 10s, `TRIGGER_FRESH_WINDOW_SECONDS=60`, `REACQUIRE_COOLDOWN_SECONDS=300`) are reasoned from the spec's documented episode length (90-110s) and date persistence (F9/F10), not verified against a live episode** - this whole mechanism inherits round 1's biggest open item (R17 itself unverified against the live site, §4/§7) as its foundation. If R17's actual live behavior turns out to refresh dates correctly, this machinery should rarely if ever fire in production, which would be the sign everything is working; frequent `DATE_REFRESH_SUSPECT` firings on the first live test would point back at R17, not at these thresholds, and should be investigated there first per §4's original guidance.
 3. **The worked example above assumes exactly one available date and a perfectly regular 10s trigger cadence** - both match the spec's own documented New Delhi/episode behavior, but a live episode with more dates or an irregular re-announcement cadence would change the precise before/after numbers (though not the qualitative conclusion: round 2's mechanism scaled with trigger count regardless of actual availability, round 3's scales with actual poll evidence).
+
+## 10. Follow-up fixes (round 4)
+
+Implemented by: Claude (Sonnet 5, Cowork session) &nbsp;&nbsp; Date: 2026-08-02 &nbsp;&nbsp; Branch: `gcp-booker` &nbsp;&nbsp; Commits: *not committed - same sandbox `.git/index.lock` permission restriction as rounds 1-3; all changes are in the working tree.*
+
+**The bug this round fixes.** A live dry run against Abu Dhabi (`/tmp/daemon_t2.log`, `/tmp/daemon_t3.log`) confirmed rounds 1-3 work correctly, but exposed one CRITICAL regression: the CAPTCHA token reserve is cold at exactly the moment it's first needed, making the daemon's cold-start path SLOWER than the old Playwright booker it's meant to replace. Observed: seat acquired 17:35:42 -> slot found 17:35:44 -> reserve empty -> ~20s on-demand solve -> would-have-booked 17:36:04 (the reserve's own first token didn't land until 17:35:59, 17s AFTER the seat was already parked and polling). Same sandbox constraints as rounds 1-3: no network egress to `broneering.mfa.ee`, no `CAPSOLVER_API_KEY`, no Telegram credentials - nothing below made a live request or booked anything.
+
+### Fix table
+
+| Fix | Description | Status | File:line | Notes |
+|-----|--------------|--------|-----------|-------|
+| 11 (CRITICAL) | Warm the token reserve CONCURRENTLY with seat acquisition's own CAPTCHA solve, instead of starting it only after the seat is established | Done | `TokenReserve.prewarm()` `estonia_booker_daemon.py:624`, `_solve_and_store()` `:639`, `_run()`'s first-iteration skip `:658`; called from `SeatManager.acquire()` `:769` (before `check_service_offered()`/`solve_on_demand()`) and from `begin_overlapping_reacquire()`'s `_do_reacquire()` `:866` | `solve_capsolver()` (the reserve's solve) has no dependency on the session/seat being established - unlike the still-open R9 concurrency question (round 1 §3), which is about threading the ACQUISITION's own gate-passing solve together with session-dependent HTTP steps. Prewarming is dependency-free and safe to start immediately, at T+0. `_run()`'s `_has_fresh_token()` check on its first pass avoids burning a second, redundant solve if the prewarm already delivered one by the time `start()`'s periodic loop begins. |
+| 12 | Trigger an immediate background re-solve whenever `TokenReserve.take()` consumes or discards a token, instead of waiting for the next periodic `TOKEN_REFRESH_SECONDS` (75s) tick | Done | `TokenReserve.take()` `estonia_booker_daemon.py:675` (both the valid-token and stale-discard branches spawn `_solve_and_store(reason="post-take")`) | `_solve_and_store()`'s `_resolve_in_progress` guard (shared with the periodic loop and `prewarm()`) means this never causes two solves to run at once - it's a dedupe on cost, not a correctness issue. |
+| 13 | Never block the main loop / poll cadence on an on-demand solve at booking time | Done | `attempt_booking()` `estonia_booker_daemon.py:982` (dispatches `_background_solve_and_finish()` in a thread when the reserve is empty, returns `False` immediately), `_finish_booking()` `:1076` (does the actual DRY_RUN-stop-or-real-submit, always run off the main thread in this path), `seat_mgr.booking_lock`/`booking_in_progress` `:735-736` (single-flight guard), `seat_mgr.session_lock` `:745` (serializes the eventual submit against a concurrent free-times query on the same session - wired into `poll_cycle()`'s query call `:1364`, `maybe_refresh_dates()`'s R17 refresh call `:1203`, and `_finish_booking()`'s submit call `:1116`) | The CAPTCHA solve itself touches no session state (F4) so it runs fully unblocked; only the final submit needs `session_lock`, and it's held for a single sub-second HTTP call, not the ~15-25s solve. `booking_in_progress` prevents a second poll cycle from dispatching a concurrent booking attempt while one is already solving/submitting - "keep the booking attempt itself sequential and correct," per the round-4 instructions, just not blocking. |
+| 14 | `DAEMON_DRY_RUN=1` attempts a booking only once | Done | `_dry_run_completed` module-level `threading.Event` `estonia_booker_daemon.py:979`, checked at the top of `attempt_booking()` `:993`, set inside `_finish_booking()`'s DRY_RUN branch `:1102` | The FIRST dry-run pass still goes through the real reserve-or-on-demand token path (R26 requires exercising the full flow, including a CAPTCHA), demonstrating exactly what T6 needs. Every subsequent poll cycle that finds a slot short-circuits at the top of `attempt_booking()` before touching the reserve or spending anything - `POLL_RESULT`/`SLOT_FOUND` logging is unaffected, only the booking-attempt machinery stops. |
+| 15 (minor) | `elapsed_since_trigger` measures time since the EPISODE began, not since the most recent trigger re-announcement | Done | `update_episode_start()` `estonia_booker_daemon.py:1413` (pure function, directly unit-testable), wired into `main()`'s trigger-handling block `:1499` (computed BEFORE `seat_mgr.last_trigger_ts` is overwritten, since "new episode?" is judged against the PREVIOUS latest trigger) and the slot-poll cadence's `elapsed` computation | Reuses the existing `TRIGGER_FRESH_WINDOW_SECONDS` constant (round 3, Fix 7) rather than adding a new one - "no trigger for longer than this" is the same threshold for both "is this seat's suspect-evidence still fresh" and "has a new episode started," so one constant does both jobs. `seat_mgr.last_trigger_ts` (Fix 7's freshness check) is deliberately left tracking the LATEST trigger, unchanged - freshness and episode-age are different questions and must not be conflated. |
+
+### Cold-path timeline: trigger -> submit, before and after Fix 11
+
+Using the round-4 bug report's own measured timeline as the "before" case (a real Abu Dhabi dry run, not a simulation):
+
+```
+BEFORE (rounds 1-3, this round's bug):
+T+0s      Trigger received, no live seat -> SeatManager.acquire() starts.
+T+0s      Acquisition's own CAPTCHA solve starts (the ONLY solve in flight).
+T+~20s    Acquisition solve lands. establish_seat() completes -> SEAT ACQUIRED.
+T+~20s    token_reserve.start() is called for the FIRST time HERE - its own
+          first solve has not even started yet.
+T+~22s    Slot found on first poll (seat acquired 17:35:42, slot found 17:35:44
+          per the bug report - ~2s later).
+T+~22s    attempt_booking() calls token_reserve.take() -> EMPTY (reserve's
+          first solve only started at T+~20s and hasn't finished).
+T+~22s    Falls back to solve_on_demand() - BLOCKS the main loop for the
+          full ~15-25s solve (this is what Fix 13 also fixes, but even
+          fixed, Fix 13 alone doesn't shrink the TOTAL cold-path time below -
+          it just stops it from also freezing the poll loop while it waits).
+T+~22s    Reserve's OWN first solve finally lands around here too (observed
+          17:35:59, i.e. ~17s after seat acquisition) - too late, the
+          booking path already committed to its own on-demand solve.
+T+~42s    On-demand solve for the BOOKING lands. Submit happens.
+------------------------------------------------------------------------------
+TOTAL: ~41-42s from trigger to submit (~21s acquisition + ~20s on-demand
+booking solve) - SLOWER than the ~25s the old Playwright booker took, which
+is the whole regression this round exists to fix.
+```
+
+```
+AFTER (round 4, Fix 11):
+T+0s      Trigger received, no live seat -> SeatManager.acquire() starts.
+T+0s      TWO solves start in parallel: the acquisition's own CAPTCHA solve,
+          AND (via the new token_reserve.prewarm() call at the very top of
+          acquire()) the reserve's first solve. Neither waits on the other -
+          they are two independent CapSolver tasks running concurrently.
+T+~20s    BOTH solves land at roughly the same time (independent tasks of
+          similar duration, per F3's 14-25s / mean ~19s range). Acquisition
+          completes -> SEAT ACQUIRED, AND the reserve already holds a fresh
+          token (or one lands within a couple of seconds either side,
+          well inside TOKEN_MAX_AGE_SECONDS=100 - see the round-4 task's own
+          "3s old, well inside 100s, no conflict" note).
+T+~20s    token_reserve.start() is called - _run()'s first-iteration check
+          sees a fresh token already present and does NOT burn a second,
+          redundant solve; it just starts the normal TOKEN_REFRESH_SECONDS
+          cadence from here.
+T+~21s    First poll finds a slot. attempt_booking() calls
+          token_reserve.take() -> a token IS available (the reserve landed
+          concurrently with acquisition, not 17-20s after it).
+T+~21s    Submit happens immediately using the reserve's token.
+------------------------------------------------------------------------------
+TOTAL: ~21s from trigger to submit (one ~20s acquisition CAPTCHA, with the
+reserve's solve riding alongside it for free) - matching spec §4.3's original
+target timeline almost exactly ("T+20s seat acquired AND a fresh submit
+token in hand -> T+21s submit"), and back below the ~25s the daemon was
+built to beat.
+```
+
+If the reserve's token happens to age past `TOKEN_MAX_AGE_SECONDS=100` before a slot is found (a seat can sit parked for minutes between episodes, F9), Fix 12 means the reserve refills within ~20s of the PREVIOUS token being taken/discarded rather than sitting empty for up to 75s - so even a booking attempt that lands well after acquisition should still usually find a warm reserve, not fall back to on-demand.
+
+### Test results
+
+**Compile check:**
+```
+$ python3 -c "import py_compile; py_compile.compile('estonia_booker_daemon.py', doraise=True); print('OK')"
+OK
+$ python3 -c "import py_compile; py_compile.compile('test_daemon_units.py', doraise=True); print('OK')"
+OK
+```
+
+**`estonia_visa_monitor.py` untouched (constraint check):**
+```
+$ git diff --stat estonia_visa_monitor.py
+$
+```
+Empty output - confirmed no diff. This file was not opened for editing at any point in this round-4 session either.
+
+**`test_daemon_units.py` (extended this round with Fix 11's concurrent-solve test, Fix 12's immediate-resolve tests, Fix 13's non-blocking/single-flight tests, Fix 14's dry-run-one-shot test, and Fix 15's pure-function episode tests) - full real output:**
+
+```
+[PASS] rank_dates: latest >=3-day-out date ranked first
+[PASS] rank_dates: all 4 input dates present in output (no silent drops)
+[PASS] rank_dates: fallback to earliest-first when no date is >=3 days out
+[PASS] rank_dates: R22 full ordering - good dates (>=3d out) descending, then fallback ascending
+[PASS] rank_dates: malformed date strings are silently skipped
+[PASS] choose_time: prefers earliest slot in 12:00-14:00
+[PASS] choose_time: falls back to earliest overall when nothing is in 12:00-14:00
+[PASS] choose_time: returns None for an empty list
+[PASS] choose_time: skips unparseable labels rather than crashing
+[PASS] extract_token: finds a plain <input> token
+[PASS] extract_token: returns None when absent
+[PASS] extract_token: finds a token nested inside a turbo-stream/template
+[PASS] is_seat_dead: a response with both token AND date field is ALIVE
+[PASS] is_seat_dead: token present but date field gone => DEAD (R13 signature)
+[PASS] is_seat_dead: checkboxes present (even without the date input) is NOT treated as dead
+[PASS] is_seat_dead: no token at all is NOT the R13 signature (that's a different failure - markup change)
+[PASS] RateLimiter: burst allowance grants the first `burst` acquires with zero waiting
+[PASS] RateLimiter: 4th acquire (bucket exhausted) waits exactly 1/rate=1.0s and advances the clock accordingly
+[PASS] RateLimiter.measured_rate(): reports ~4 req in ~1s after the sequence above
+[PASS] RateLimiter: RATE_THROTTLED logs exactly once for a burst of throttled acquires within one 30s log window
+[PASS] RateLimiter: RATE_THROTTLED logs again once >=30s has passed since the last log
+[PASS] RateLimiter: 10 sequential acquires against a slow rate all complete (blocks, never drops/raises)
+[PASS] maybe_refresh_dates: not forced, interval not yet elapsed -> skipped, no refresh call, returns False
+[PASS] maybe_refresh_dates: not forced, interval elapsed -> refresh IS called, returns False (nothing suspect for non-forced)
+[PASS] maybe_refresh_dates: forced, but within FORCED_REFRESH_MIN_INTERVAL_SECONDS of the last forced refresh -> debounced, no call
+[PASS] maybe_refresh_dates: forced, debounce interval elapsed -> refresh IS called this time
+[PASS] maybe_refresh_dates: forced refresh never sets last_reacquire_ts - that decision lives entirely in check_suspect_and_maybe_reacquire() now
+[PASS] check_suspect_and_maybe_reacquire: streak at threshold + fresh trigger + cooldown elapsed -> fires, resets streak, records last_reacquire_ts
+[PASS] check_suspect_and_maybe_reacquire: streak below threshold -> no action, streak untouched
+[PASS] check_suspect_and_maybe_reacquire: stale trigger -> ignored even with a high empty-poll streak
+[PASS] SeatManager.empty_poll_streak: a non-empty poll result resets the streak to 0 (poll_cycle()'s behaviour, exercised directly here)
+[PASS] check_suspect_and_maybe_reacquire: within REACQUIRE_COOLDOWN_SECONDS -> suppressed, no reacquire, streak reset, last_reacquire_ts untouched
+[PASS] check_suspect_and_maybe_reacquire: the seat is STILL live at the moment begin_overlapping_reacquire() is called - never dropped first
+[PASS] begin_overlapping_reacquire: refuses to start a second reacquisition while one is already in flight (R14, shared with TTL renewal)
+[PASS] SeatManager: starts with last_slot_poll_ts=0.0 (so the very first main-loop tick after acquire polls immediately)
+[PASS] SeatManager.drop_seat(): resets last_slot_poll_ts/last_date_refresh_ts/dates_at_acquisition/empty_poll_streak
+[PASS] Fix 11: reserve's prewarm solve starts without waiting for the acquisition's own solve to finish first
+[PASS] Fix 11: acquisition's own CAPTCHA solve starts without waiting for the reserve's prewarm solve to finish first
+[PASS] Fix 11: acquire() completes successfully once both concurrent solves are released
+[PASS] Fix 11: begin_overlapping_reacquire() also prewarms the reserve for the seat it's about to swap in
+[PASS] TokenReserve.take(): returns the currently-held fresh token (unchanged behaviour)
+[PASS] Fix 12: take()-ing a valid token kicks an immediate background re-solve, not waiting for the periodic tick
+[PASS] TokenReserve.take(): a token older than TOKEN_MAX_AGE_SECONDS is discarded, not returned (R29, unchanged)
+[PASS] Fix 12: discarding a stale token on take() ALSO kicks an immediate background re-solve
+[PASS] TokenReserve.take(): calling take() on a genuinely-empty reserve doesn't kick a redundant solve
+[PASS] Fix 13: attempt_booking() returns immediately when the reserve is empty, instead of blocking on the on-demand solve
+[PASS] Fix 13: the on-demand solve IS running in the background at this point
+[PASS] Fix 13: booking_in_progress is set while the background attempt is in flight
+[PASS] Fix 13: a second attempt_booking() call while one is already in flight does not start another (single booking attempt at a time)
+[PASS] Fix 13: the background attempt eventually solves and submits (R23 preserved - just not blocking the caller)
+[PASS] Fix 13: booking_in_progress is cleared once the background attempt finishes
+[PASS] Fix 14: first DAEMON_DRY_RUN=1 attempt runs the full flow, logs 'would have booked', and sets the one-shot completed flag
+[PASS] Fix 14: a second DAEMON_DRY_RUN=1 attempt short-circuits immediately - no further token spend, no further Telegram
+[PASS] update_episode_start: the very first trigger ever (previous_last_trigger_ts<=0) starts a new episode
+[PASS] update_episode_start: a re-announcement within TRIGGER_FRESH_WINDOW_SECONDS of the previous one continues the SAME episode
+[PASS] update_episode_start: many re-announcements in a row, all within the fresh window, all still point back to the ORIGINAL episode start
+[PASS] update_episode_start: a gap LONGER than TRIGGER_FRESH_WINDOW_SECONDS since the last trigger starts a NEW episode
+[PASS] update_episode_start: episode_start_ts=None always resets to the new trigger, regardless of the gap
+
+ALL TESTS PASSED
+```
+
+(58 checks total, 58 passed. One failure on first write, fixed before this final run: the "take() on an already-empty reserve doesn't kick a redundant solve" test initially reused the reserve right after the stale-token-discard test, which had ALSO just kicked its own Fix-12 background re-solve - by the time the next `take()` ran, that background solve had often already landed a fresh token, so `take()` correctly returned it instead of `None` (Fix 12 working exactly as designed, not a bug). Fixed by explicitly forcing the reserve empty (`reserve._token = None`) immediately before that specific assertion, rather than relying on timing to leave it empty. Recorded here per this codebase's established practice of showing real, including initially-wrong, results.)
+
+**Smoke test (confirms the daemon still starts/shuts down cleanly with Fix 11-15's new locks/threads/state present):**
+```
+$ EMBASSY_ID=244 EMBASSY_NAME="Abu Dhabi" DAEMON_DRY_RUN=1 timeout 4 python3 estonia_booker_daemon.py
+2026-08-02T17:59:16+00:00 [INFO] Daemon starting. embassy=244/Abu Dhabi dry_run=True self_detect=False captcha_provider=capsolver
+2026-08-02T17:59:16+00:00 [INFO] Telegram not configured, skipping send: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set
+2026-08-02T17:59:20+00:00 [INFO] Received signal 15 - finishing any in-flight work then shutting down (R40)
+2026-08-02T17:59:20+00:00 [INFO] Daemon shutting down cleanly (R40)
+2026-08-02T17:59:20+00:00 [INFO] Telegram not configured, skipping send: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set
+```
+Lock file (`/tmp/estonia_booker_daemon_244.lock`) confirmed removed after exit. No trigger file existed during this run, so (as in every previous round's smoke test) this does not exercise seat acquisition, the new concurrent-solve path, or booking end-to-end - that remains dependent on a live test. `timeout`'s own exit code (124) reflects that the *shell wrapper* sent the signal at the 4s mark, not the daemon's own exit status - the log lines above show the daemon itself handled SIGTERM and shut down cleanly (R40), consistent with every prior round's smoke test.
+
+### Deviations from these instructions, and why
+
+No deviations from the five fixes as specified. Two implementation choices were judgment calls where the instructions described the desired OUTCOME but not the exact mechanism:
+
+1. **Fix 13's non-blocking design still serializes the final submit against concurrent free-times queries via a new `seat_mgr.session_lock`**, rather than letting the submit and queries run fully unordered. The instructions said "Polling must continue during that window" and "keep the booking attempt itself sequential and correct - do not attempt concurrent bookings." Reading both together: R16 already establishes that concurrent HTTP calls on the SAME session can corrupt server-side state ("the server tracks a 'currently selected date' in session state and concurrent queries may corrupt it"), and a background submit racing a foreground query is exactly that risk. The design threads the needle by only holding `session_lock` for the CAPTCHA-free, sub-second HTTP calls (queries, R17 refreshes, submit) - never for the ~15-25s solve itself, which touches no session state at all (F4). This satisfies both instructions simultaneously: the main loop and poll cadence are never blocked by the solve, and the one truly session-sensitive operation (the submit) still can't interleave with a query.
+2. **`booking_in_progress` is a single boolean per `SeatManager`, not per-date.** A second `attempt_booking()` call for a DIFFERENT date while one attempt is in flight is also suppressed (see the test: "a second attempt_booking() call ... does not start another"), not just a second call for the SAME date. Given `session_lock` would serialize any two submits against the same session anyway, this is a slightly more conservative (belt-and-suspenders) reading of "keep the booking attempt itself sequential" than strictly necessary, but avoids any scenario where two submits race to be first through the lock in an order that isn't obviously deterministic - and since R19/R22's whole design is "book the first thing that works, then stop," attempting a second date while the first is still in flight has little value anyway (if the first succeeds, R25 stops everything; if it fails, the very next poll cycle tries again with R22's full fallback ordering, in cycles ~2s apart).
+
+### Anything unsure about
+
+1. **The cold-path timeline's "AFTER" numbers assume both concurrent solves (acquisition's and the reserve's) take roughly the same ~14-25s** (F3's measured range) and land close enough together that the reserve's token is fresh by the time a slot is found. If CapSolver's queue happens to serialize two simultaneous tasks from the same account rather than truly parallelizing them, the reserve's token could land noticeably later than modeled here - this is a real infrastructure assumption (whether CapSolver processes two `createTask` calls from one `clientKey` concurrently or queues them) that could not be verified in this sandbox (no `CAPSOLVER_API_KEY`, no network). Worth watching closely on the very first live test: if the reserve's `TOKEN_REFRESHED (reason=prewarm)` line lands meaningfully more than ~25s after `SEAT_ACQUIRING`, that's evidence CapSolver is serializing rather than parallelizing, and the whole premise of Fix 11 (two truly independent, concurrent solves) needs revisiting.
+2. **`booking_in_progress`'s single-flight guard means a genuinely-different, better slot found while an earlier (worse) slot's booking attempt is still solving/submitting is NOT tried until the first attempt resolves.** Given R20/R21's preference ordering already picks the best available slot first and R22 walks every date within one `poll_cycle()` pass before giving up, this should rarely matter in practice (the "first" attempt dispatched is already the preferred one), but it is a real, if narrow, trade-off of "sequential and correct" against "always chase the single best-known slot."
+3. **Fix 15's episode definition (`update_episode_start()`) reuses `TRIGGER_FRESH_WINDOW_SECONDS` (60s, round 3's Fix 7 constant) as the episode-gap threshold.** This is a clean, low-footprint choice (one constant instead of two), but it does mean tuning one changes the meaning of both "is this seat's suspect evidence still fresh" (Fix 7) and "has a new episode begun" (Fix 15) together. If real episode timing (F9: 4-7 minute gaps between clusters, ~90-110s within a cluster) ever calls for treating these as genuinely different thresholds, they can be split into two constants later - not done here to keep this round's footprint to what was actually asked for.
+4. **This round did not re-verify R17 or re-run the round-3 suspect-detection worked example against the new Fix-13 session-locking behavior.** Fix 13 adds contention (however brief) between `poll_cycle()`'s queries, `maybe_refresh_dates()`'s R17 refresh, and a backgrounded submit, all now serialized through the same `session_lock` - in the extremely unlikely event all three want the lock at once, whichever loses waits a sub-second beat, which should be immaterial to round 3's `empty_poll_streak`/suspect-detection timing (poll cadence is 2s, sub-second lock contention is noise by comparison), but this interaction was reasoned through rather than empirically re-tested end-to-end.

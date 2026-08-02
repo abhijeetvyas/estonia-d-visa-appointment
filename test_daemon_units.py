@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import io
 import sys
+import threading
 import time as time_module
 from datetime import datetime, timedelta, timezone
 
@@ -484,6 +485,334 @@ def main() -> int:
         and seat_mgr2.last_date_refresh_ts == 0.0
         and seat_mgr2.dates_at_acquisition == []
         and seat_mgr2.empty_poll_streak == 0,
+    )
+
+    # =========================================================================
+    # Round-4 Fix 11: reserve prewarm runs CONCURRENTLY with acquisition's own
+    # CAPTCHA solve, not after establish_seat() returns. `solve_capsolver`
+    # (the reserve's solve) and `solve_on_demand` (the acquisition's own
+    # solve) are both monkeypatched to block on a shared release gate until
+    # BOTH have signalled they've started - proving neither waited for the
+    # other before beginning.
+    # =========================================================================
+
+    reserve_solve_started = threading.Event()
+    acquisition_solve_started = threading.Event()
+    release_solves = threading.Event()
+
+    def fake_solve_capsolver_concurrent(timeout=120):
+        reserve_solve_started.set()
+        release_solves.wait(3)
+        return "RESERVE_TOKEN"
+
+    def fake_solve_on_demand_concurrent(timeout=120):
+        acquisition_solve_started.set()
+        release_solves.wait(3)
+        return "ACQUISITION_TOKEN"
+
+    def fake_check_service_offered(session, embassy_id):
+        return True, ["Long-stay visa (D-visa) application"], "<html></html>"
+
+    def fake_establish_seat(embassy_id, applicant, token, session=None):
+        return make_seat([iso(5)])
+
+    real_solve_capsolver = daemon.solve_capsolver
+    real_solve_on_demand = daemon.solve_on_demand
+    real_check_service_offered = daemon.check_service_offered
+    real_establish_seat = daemon.establish_seat
+    real_load_applicant_data = daemon.load_applicant_data
+    real_cache_applicant = daemon.cache_applicant_on_seat
+    real_is_already_booked = daemon.is_already_booked
+    real_mark_booked = daemon.mark_booked
+    real_send_telegram = daemon.send_telegram
+    real_submit_booking = daemon.submit_booking
+
+    daemon.solve_capsolver = fake_solve_capsolver_concurrent
+    daemon.solve_on_demand = fake_solve_on_demand_concurrent
+    daemon.check_service_offered = fake_check_service_offered
+    daemon.establish_seat = fake_establish_seat
+    daemon.load_applicant_data = lambda: {"specifying_information": "x"}
+    daemon.cache_applicant_on_seat = lambda seat, applicant: None
+
+    seat_mgr_11 = daemon.SeatManager()
+    try:
+        acquire_thread = threading.Thread(target=seat_mgr_11.acquire, kwargs={"elapsed_since_trigger": 0.0})
+        acquire_thread.start()
+        reserve_ok = reserve_solve_started.wait(2)
+        acquisition_ok = acquisition_solve_started.wait(2)
+        check(
+            "Fix 11: reserve's prewarm solve starts without waiting for the acquisition's own solve to finish first",
+            reserve_ok,
+            f"reserve_solve_started={reserve_solve_started.is_set()}",
+        )
+        check(
+            "Fix 11: acquisition's own CAPTCHA solve starts without waiting for the reserve's prewarm solve to finish first",
+            acquisition_ok,
+            f"acquisition_solve_started={acquisition_solve_started.is_set()}",
+        )
+        release_solves.set()
+        acquire_thread.join(timeout=3)
+        check(
+            "Fix 11: acquire() completes successfully once both concurrent solves are released",
+            not acquire_thread.is_alive() and seat_mgr_11.has_live_seat(),
+            f"thread_alive={acquire_thread.is_alive()} has_live_seat={seat_mgr_11.has_live_seat()}",
+        )
+    finally:
+        daemon.solve_capsolver = real_solve_capsolver
+        daemon.solve_on_demand = real_solve_on_demand
+        daemon.check_service_offered = real_check_service_offered
+        daemon.establish_seat = real_establish_seat
+        daemon.load_applicant_data = real_load_applicant_data
+        daemon.cache_applicant_on_seat = real_cache_applicant
+        seat_mgr_11.token_reserve.stop()
+
+    # --- Fix 11 also applies to begin_overlapping_reacquire() - a
+    # swapped-in seat should arrive with a warm reserve too ---
+    prewarm_calls: list[str] = []
+    seat_mgr_11b = fresh_seat_mgr([iso(5)])
+    seat_mgr_11b.token_reserve.prewarm = lambda: prewarm_calls.append("called")
+    daemon.check_service_offered = fake_check_service_offered
+    daemon.solve_on_demand = lambda timeout=120: "TOKEN"
+    daemon.establish_seat = fake_establish_seat
+    daemon.load_applicant_data = lambda: {"specifying_information": "x"}
+    daemon.cache_applicant_on_seat = lambda seat, applicant: None
+    try:
+        started = seat_mgr_11b.begin_overlapping_reacquire(reason="ttl_renewal")
+        deadline = time_module.time() + 2
+        while not prewarm_calls and time_module.time() < deadline:
+            time_module.sleep(0.05)
+        check(
+            "Fix 11: begin_overlapping_reacquire() also prewarms the reserve for the seat it's about to swap in",
+            started and prewarm_calls == ["called"],
+            f"started={started} prewarm_calls={prewarm_calls}",
+        )
+    finally:
+        daemon.check_service_offered = real_check_service_offered
+        daemon.solve_on_demand = real_solve_on_demand
+        daemon.establish_seat = real_establish_seat
+        daemon.load_applicant_data = real_load_applicant_data
+        daemon.cache_applicant_on_seat = real_cache_applicant
+
+    # =========================================================================
+    # Round-4 Fix 12: TokenReserve.take() triggers an immediate background
+    # re-solve, instead of leaving the reserve empty for up to
+    # TOKEN_REFRESH_SECONDS (75s).
+    # =========================================================================
+
+    solve_call_log: list[float] = []
+
+    def fake_solve_capsolver_log(timeout=120):
+        solve_call_log.append(time_module.time())
+        return f"TOKEN_{len(solve_call_log)}"
+
+    daemon.solve_capsolver = fake_solve_capsolver_log
+    reserve = daemon.TokenReserve()
+    try:
+        reserve._token = "PRELOADED"
+        reserve._token_ts = time_module.time()
+        result = reserve.take()
+        check(
+            "TokenReserve.take(): returns the currently-held fresh token (unchanged behaviour)",
+            result == "PRELOADED",
+            f"result={result}",
+        )
+        deadline = time_module.time() + 2
+        while not solve_call_log and time_module.time() < deadline:
+            time_module.sleep(0.05)
+        check(
+            "Fix 12: take()-ing a valid token kicks an immediate background re-solve, not waiting for the periodic tick",
+            len(solve_call_log) >= 1,
+            f"solve_call_log={solve_call_log}",
+        )
+
+        # Discarding a STALE token on take() must ALSO trigger an immediate re-solve.
+        solve_call_log.clear()
+        reserve._token = "STALE_TOKEN"
+        reserve._token_ts = time_module.time() - (daemon.TOKEN_MAX_AGE_SECONDS + 10)
+        result2 = reserve.take()
+        check(
+            "TokenReserve.take(): a token older than TOKEN_MAX_AGE_SECONDS is discarded, not returned (R29, unchanged)",
+            result2 is None,
+            f"result2={result2}",
+        )
+        deadline2 = time_module.time() + 2
+        while not solve_call_log and time_module.time() < deadline2:
+            time_module.sleep(0.05)
+        check(
+            "Fix 12: discarding a stale token on take() ALSO kicks an immediate background re-solve",
+            len(solve_call_log) >= 1,
+            f"solve_call_log={solve_call_log}",
+        )
+
+        # take() on a GENUINELY already-empty reserve (no token to consume or
+        # discard) shouldn't spawn a redundant solve. Force it empty here
+        # rather than relying on timing, since the stale-discard case above
+        # may itself have already refilled it via its own Fix-12 re-solve by
+        # the time this line runs (that's Fix 12 working correctly, not a
+        # race to avoid).
+        with reserve._lock:
+            reserve._token = None
+        solve_call_log.clear()
+        result3 = reserve.take()
+        time_module.sleep(0.2)
+        check(
+            "TokenReserve.take(): calling take() on a genuinely-empty reserve doesn't kick a redundant solve",
+            result3 is None and len(solve_call_log) == 0,
+            f"result3={result3} solve_call_log={solve_call_log}",
+        )
+    finally:
+        daemon.solve_capsolver = real_solve_capsolver
+        reserve.stop()
+
+    # =========================================================================
+    # Round-4 Fix 13: an on-demand solve at booking time must never block the
+    # main loop / poll cadence, and a booking attempt must remain
+    # single-flight (no concurrent submits on the same session, R16).
+    # =========================================================================
+
+    solve_started = threading.Event()
+    release_solve = threading.Event()
+
+    def slow_solve_on_demand(timeout=120):
+        solve_started.set()
+        release_solve.wait(3)
+        return "ON_DEMAND_TOKEN"
+
+    submit_calls: list[tuple] = []
+
+    def fake_submit_booking(seat, date_iso, slot_value, captcha_token, notes=""):
+        submit_calls.append((date_iso, slot_value, captcha_token))
+        return True, "<html>Booked time</html>"
+
+    daemon.solve_on_demand = slow_solve_on_demand
+    daemon.submit_booking = fake_submit_booking
+    daemon.is_already_booked = lambda: False
+    daemon.mark_booked = lambda details: None
+    daemon.send_telegram = lambda msg: None
+    daemon.load_applicant_data = lambda: {"specifying_information": "x"}
+
+    seat_mgr_13 = fresh_seat_mgr([iso(5)])
+    slot_13 = daemon.Slot(value="999", time="13:00")
+
+    try:
+        call_started = time_module.time()
+        result = daemon.attempt_booking(seat_mgr_13, iso(5), slot_13, elapsed_since_trigger=1.0)
+        call_duration = time_module.time() - call_started
+        check(
+            "Fix 13: attempt_booking() returns immediately when the reserve is empty, instead of blocking on the on-demand solve",
+            result is False and call_duration < 1.0,
+            f"result={result} call_duration={call_duration:.2f}s",
+        )
+        check(
+            "Fix 13: the on-demand solve IS running in the background at this point",
+            solve_started.is_set(),
+        )
+        check(
+            "Fix 13: booking_in_progress is set while the background attempt is in flight",
+            seat_mgr_13.booking_in_progress is True,
+        )
+
+        # A second slot found while the first is still solving must NOT
+        # dispatch a second, concurrent booking attempt.
+        result2 = daemon.attempt_booking(seat_mgr_13, iso(6), slot_13, elapsed_since_trigger=1.0)
+        check(
+            "Fix 13: a second attempt_booking() call while one is already in flight does not start another (single booking attempt at a time)",
+            result2 is False and len(submit_calls) == 0,
+            f"result2={result2} submit_calls={submit_calls}",
+        )
+
+        release_solve.set()
+        deadline = time_module.time() + 3
+        while not submit_calls and time_module.time() < deadline:
+            time_module.sleep(0.05)
+        check(
+            "Fix 13: the background attempt eventually solves and submits (R23 preserved - just not blocking the caller)",
+            len(submit_calls) == 1 and submit_calls[0][0] == iso(5),
+            f"submit_calls={submit_calls}",
+        )
+        deadline2 = time_module.time() + 2
+        while seat_mgr_13.booking_in_progress and time_module.time() < deadline2:
+            time_module.sleep(0.05)
+        check(
+            "Fix 13: booking_in_progress is cleared once the background attempt finishes",
+            seat_mgr_13.booking_in_progress is False,
+        )
+    finally:
+        daemon.solve_on_demand = real_solve_on_demand
+        daemon.submit_booking = real_submit_booking
+        daemon.is_already_booked = real_is_already_booked
+        daemon.mark_booked = real_mark_booked
+        daemon.send_telegram = real_send_telegram
+        daemon.load_applicant_data = real_load_applicant_data
+
+    # =========================================================================
+    # Round-4 Fix 14: DAEMON_DRY_RUN=1 attempts a booking only ONCE, not on
+    # every poll cycle forever.
+    # =========================================================================
+
+    daemon._dry_run_completed.clear()
+    real_dry_run = daemon.DAEMON_DRY_RUN
+    daemon.DAEMON_DRY_RUN = True
+    daemon.is_already_booked = lambda: False
+    daemon.solve_on_demand = lambda timeout=120: "FAKE_DRY_RUN_TOKEN"
+    telegram_msgs: list[str] = []
+    daemon.send_telegram = lambda msg: telegram_msgs.append(msg)
+    seat_mgr_14 = fresh_seat_mgr([iso(5)])
+    slot_14 = daemon.Slot(value="111", time="12:15")
+
+    try:
+        daemon.attempt_booking(seat_mgr_14, iso(5), slot_14, elapsed_since_trigger=1.0)
+        deadline = time_module.time() + 2
+        while not daemon._dry_run_completed.is_set() and time_module.time() < deadline:
+            time_module.sleep(0.05)
+        check(
+            "Fix 14: first DAEMON_DRY_RUN=1 attempt runs the full flow, logs 'would have booked', and sets the one-shot completed flag",
+            daemon._dry_run_completed.is_set() and any("DRY RUN" in m for m in telegram_msgs),
+            f"dry_run_completed={daemon._dry_run_completed.is_set()} telegram_msgs={telegram_msgs}",
+        )
+        telegram_count_after_first = len(telegram_msgs)
+
+        result_second = daemon.attempt_booking(seat_mgr_14, iso(5), slot_14, elapsed_since_trigger=1.0)
+        time_module.sleep(0.2)  # give any (unexpected) background thread a chance to misbehave
+        check(
+            "Fix 14: a second DAEMON_DRY_RUN=1 attempt short-circuits immediately - no further token spend, no further Telegram",
+            result_second is False and len(telegram_msgs) == telegram_count_after_first,
+            f"result_second={result_second} telegram_msgs={telegram_msgs}",
+        )
+    finally:
+        daemon.DAEMON_DRY_RUN = real_dry_run
+        daemon.is_already_booked = real_is_already_booked
+        daemon.solve_on_demand = real_solve_on_demand
+        daemon.send_telegram = real_send_telegram
+        daemon._dry_run_completed.clear()
+
+    # =========================================================================
+    # Round-4 Fix 15 (minor): episode-based elapsed_since_trigger
+    # (update_episode_start()) - pure function, no monkeypatching needed.
+    # =========================================================================
+
+    t0 = 1_000_000.0  # arbitrary fixed reference point - avoids any real-clock flakiness
+    check(
+        "update_episode_start: the very first trigger ever (previous_last_trigger_ts<=0) starts a new episode",
+        daemon.update_episode_start(None, 0.0, t0) == t0,
+    )
+    check(
+        "update_episode_start: a re-announcement within TRIGGER_FRESH_WINDOW_SECONDS of the previous one continues the SAME episode",
+        daemon.update_episode_start(t0, t0, t0 + 10) == t0,
+    )
+    check(
+        "update_episode_start: many re-announcements in a row, all within the fresh window, all still point back to the ORIGINAL episode start",
+        daemon.update_episode_start(t0, t0 + 10, t0 + 20) == t0,
+    )
+    gap_new_trigger = t0 + 500
+    check(
+        "update_episode_start: a gap LONGER than TRIGGER_FRESH_WINDOW_SECONDS since the last trigger starts a NEW episode",
+        daemon.update_episode_start(t0, t0 + 20, gap_new_trigger) == gap_new_trigger,
+        f"got {daemon.update_episode_start(t0, t0 + 20, gap_new_trigger)}",
+    )
+    check(
+        "update_episode_start: episode_start_ts=None always resets to the new trigger, regardless of the gap",
+        daemon.update_episode_start(None, t0, t0 + 1) == t0 + 1,
     )
 
     print()
