@@ -863,16 +863,26 @@ class TokenReserve:
             log_line("TOKEN_STALE", f"{dropped} reserve token(s) expired unused and were discarded")
         self._tokens = keep
 
-    def _deficit(self) -> int:
-        """How many more solves are needed to reach the target, counting
-        those already in flight so a burst of callers cannot stampede."""
+    def _reserve_slots(self) -> int:
+        """Atomically work out how many solves are still needed AND claim
+        them, returning that count.
+
+        Claiming under the same lock as the calculation is the point.
+        Previously `_solves_in_flight` was incremented inside each spawned
+        thread, so two callers arriving together (the maintenance loop and a
+        post-take top-up, say) could both compute the same deficit before
+        either had registered its intent - and each would then spend real
+        money solving CAPTCHAs the other had already covered.
+        """
         with self._lock:
             self._prune_locked()
-            return max(0, TOKEN_RESERVE_SIZE - len(self._tokens) - self._solves_in_flight)
+            need = max(0, TOKEN_RESERVE_SIZE - len(self._tokens) - self._solves_in_flight)
+            self._solves_in_flight += need
+            return need
 
     def _solve_one(self, reason: str) -> None:
-        with self._lock:
-            self._solves_in_flight += 1
+        """Caller must already have claimed a slot via `_reserve_slots()`;
+        this only releases it."""
         try:
             token = solve_capsolver()
             with self._lock:
@@ -891,7 +901,7 @@ class TokenReserve:
         """Solve however many tokens are missing, in parallel. Parallel
         because a serial top-up of an empty pool would take N x 20s, and the
         window we are trying to cover is shorter than that."""
-        need = self._deficit()
+        need = self._reserve_slots()
         if need <= 0:
             return
         threads = [

@@ -817,9 +817,17 @@ def main() -> int:
 
     solve_call_log: list[float] = []
 
+    _solve_lock = threading.Lock()
+
     def fake_solve_capsolver_log(timeout=120):
-        solve_call_log.append(time_module.time())
-        return f"TOKEN_{len(solve_call_log)}"
+        # Thread-safe: _top_up() solves in parallel, and a naive
+        # `len(solve_call_log)` read outside a lock let two concurrent solves
+        # return the SAME token string - which then failed the
+        # two-consecutive-takes assertion for a reason that had nothing to do
+        # with the pool. Real CapSolver returns distinct tokens.
+        with _solve_lock:
+            solve_call_log.append(time_module.time())
+            return f"TOKEN_{len(solve_call_log)}"
 
     daemon.solve_capsolver = fake_solve_capsolver_log
     reserve = daemon.TokenReserve()
@@ -842,7 +850,12 @@ def main() -> int:
             f"depth={reserve.depth()} solves={len(solve_call_log)}",
         )
 
-        # A full pool must not keep spending money.
+        # A full pool must not keep spending money. Wait for every in-flight
+        # solve to finish first, otherwise a straggler appending after the
+        # clear looks like a spurious solve.
+        _dl = time_module.time() + 5
+        while reserve._solves_in_flight and time_module.time() < _dl:
+            time_module.sleep(0.02)
         solve_call_log.clear()
         reserve._top_up(reason="test-nop")
         time_module.sleep(0.2)
@@ -872,6 +885,15 @@ def main() -> int:
 
         # Two takes in a row must both succeed - the acquire-then-submit
         # sequence is precisely what a pool of 1 would fail.
+        #
+        # Seed the pool directly rather than relying on the background
+        # refills to have landed. Depending on concurrent solves made this
+        # assertion fail intermittently for reasons unrelated to what it
+        # tests (whether two takes return two DISTINCT tokens), and a test
+        # that fails at random teaches you to ignore it.
+        _now = time_module.time()
+        with reserve._lock:
+            reserve._tokens = [("POOL_A", _now - 2), ("POOL_B", _now - 1)]
         with contextlib.redirect_stdout(io.StringIO()):
             t1 = reserve.take()
             t2 = reserve.take()
