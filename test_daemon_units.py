@@ -37,6 +37,21 @@ from datetime import datetime, timedelta, timezone
 import estonia_booker_daemon as daemon
 import estonia_booking_http as http_flow
 
+# Redirect every production artifact path into a throwaway temp directory
+# BEFORE any test runs. On 2026-08-03 a test run wrote fake BOOKING_ATTEMPT
+# lines (slot_id=999, "Stored booked_date 'garbage'"), a bogus SEAT_DIED, and
+# a fake daemon_dumps/*_booking_confirmed_40.html into the LIVE daemon log and
+# dumps directory, while a real availability episode was being investigated.
+# Test output that is indistinguishable from production output actively
+# damages incident diagnosis, which is the one thing these logs exist for.
+import pathlib as _pathlib
+import tempfile as _tempfile
+
+_TEST_TMP = _pathlib.Path(_tempfile.mkdtemp(prefix="daemon_unittest_"))
+daemon.DAEMON_LOG_FILE = _TEST_TMP / "daemon.log"
+daemon.POLLS_CSV_FILE = _TEST_TMP / "daemon_polls.csv"
+daemon.DUMPS_DIR = _TEST_TMP / "daemon_dumps"
+
 FAILURES: list[str] = []
 
 
