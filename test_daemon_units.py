@@ -926,6 +926,58 @@ def main() -> int:
             f"picked={picked!r}",
         )
 
+        # --- Round-11: proactive replacement, so the pool never dips -------
+        # Replacement takes 15-25s. A purely reactive pool (prune at
+        # TOKEN_MAX_AGE_SECONDS, then solve) is short for that whole window.
+        check(
+            "Round-11: replacement age is strictly below the usable age, so a replacement "
+            "starts while the old token is still valid",
+            daemon.TOKEN_REFRESH_SECONDS < daemon.TOKEN_MAX_AGE_SECONDS,
+            f"refresh={daemon.TOKEN_REFRESH_SECONDS} max_age={daemon.TOKEN_MAX_AGE_SECONDS}",
+        )
+        check(
+            "Round-11: the gap between them exceeds a worst-case 25s solve, so the new token "
+            "lands before the old one expires",
+            (daemon.TOKEN_MAX_AGE_SECONDS - daemon.TOKEN_REFRESH_SECONDS) >= 25,
+            f"gap={daemon.TOKEN_MAX_AGE_SECONDS - daemon.TOKEN_REFRESH_SECONDS}s",
+        )
+
+        _now = time_module.time()
+        # Two tokens past the refresh age but still usable: the pool should
+        # want two replacements while continuing to hand these out.
+        with reserve._lock:
+            reserve._tokens = [
+                ("AGING_A", _now - (daemon.TOKEN_REFRESH_SECONDS + 5)),
+                ("AGING_B", _now - (daemon.TOKEN_REFRESH_SECONDS + 5)),
+            ]
+            reserve._solves_in_flight = 0
+        check(
+            "Round-11: tokens past the refresh age no longer count toward the target, so "
+            "replacements are requested",
+            reserve._reserve_slots() == daemon.TOKEN_RESERVE_SIZE,
+            f"reserved={reserve._reserve_slots()}",
+        )
+        with reserve._lock:
+            reserve._solves_in_flight = 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            still_usable = reserve.take()
+        check(
+            "Round-11: an aging-but-unexpired token is STILL handed out (usable != counted fresh)",
+            still_usable in ("AGING_A", "AGING_B"),
+            f"got={still_usable!r}",
+        )
+
+        # Fresh tokens must not trigger pointless replacement.
+        with reserve._lock:
+            reserve._tokens = [("FRESH_A", _now - 1), ("FRESH_B", _now - 2)]
+            reserve._solves_in_flight = 0
+        check(
+            "Round-11: fresh tokens request no replacement (no runaway spend)",
+            reserve._reserve_slots() == 0,
+        )
+        with reserve._lock:
+            reserve._solves_in_flight = 0
+
         check(
             "Round-8: MAX_SOLVES_PER_HOUR was raised above the pool's own steady-state cost (~60/hr), "
             "so the safety guard cannot silently throttle the reserve",

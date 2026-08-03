@@ -141,6 +141,18 @@ SUSPECT_AFTER_EMPTY_POLLS = int(os.environ.get("SUSPECT_AFTER_EMPTY_POLLS", "5")
 # CAPTCHA every 10 seconds and never actually polls for a slot" (round 2's
 # Fix 5 bug - see IMPLEMENTATION_CHANGELOG.md §9).
 REACQUIRE_COOLDOWN_SECONDS = float(os.environ.get("REACQUIRE_COOLDOWN_SECONDS", "300"))
+# Round 11: this became dead config in round 8 (the periodic refresh loop was
+# replaced by a deficit-driven pool) and now has a real job again: the age at
+# which a REPLACEMENT solve starts, while the existing token stays usable.
+#
+# The distinction matters more than the exact numbers. Replacement is not
+# instant - it takes 15-25s - so a purely reactive pool (prune at
+# TOKEN_MAX_AGE_SECONDS, then solve) is short for that entire window, and if
+# both tokens age out together it is empty. Starting the replacement at 75s
+# means the new token lands around 90-100s while the old one is still valid,
+# so the pool never dips. Raising the max age instead would have made this
+# worse, not better: the token would be closer to expiry when replacement
+# began.
 TOKEN_REFRESH_SECONDS = int(os.environ.get("TOKEN_REFRESH_SECONDS", "75"))   # R27
 TOKEN_MAX_AGE_SECONDS = int(os.environ.get("TOKEN_MAX_AGE_SECONDS", "100"))  # R29
 # Round 8: raised 60 -> 250. A continuously-maintained pool of 2 tokens with
@@ -832,8 +844,9 @@ class TokenReserve:
         self._thread.start()
         log_line(
             "INFO",
-            f"Token reserve started: target={TOKEN_RESERVE_SIZE} tokens, "
-            f"refreshed below {TOKEN_MAX_AGE_SECONDS:.0f}s age, CapSolver only",
+            f"Token reserve started: target={TOKEN_RESERVE_SIZE} fresh tokens, "
+            f"replacement starts at {TOKEN_REFRESH_SECONDS}s, tokens usable until "
+            f"{TOKEN_MAX_AGE_SECONDS}s, CapSolver only",
         )
 
     def stop(self) -> None:
@@ -863,6 +876,19 @@ class TokenReserve:
             log_line("TOKEN_STALE", f"{dropped} reserve token(s) expired unused and were discarded")
         self._tokens = keep
 
+    def _fresh_count_locked(self) -> int:
+        """Tokens young enough that no replacement is needed yet. Caller holds
+        the lock.
+
+        Deliberately counts against TOKEN_REFRESH_SECONDS, not
+        TOKEN_MAX_AGE_SECONDS: a token past the refresh age is still perfectly
+        usable (take() will hand it out) but no longer counts toward the
+        pool's target, which is what makes a replacement start early enough to
+        land before the old one expires.
+        """
+        now = time.time()
+        return sum(1 for (_t, ts) in self._tokens if (now - ts) <= TOKEN_REFRESH_SECONDS)
+
     def _reserve_slots(self) -> int:
         """Atomically work out how many solves are still needed AND claim
         them, returning that count.
@@ -876,7 +902,7 @@ class TokenReserve:
         """
         with self._lock:
             self._prune_locked()
-            need = max(0, TOKEN_RESERVE_SIZE - len(self._tokens) - self._solves_in_flight)
+            need = max(0, TOKEN_RESERVE_SIZE - self._fresh_count_locked() - self._solves_in_flight)
             self._solves_in_flight += need
             return need
 
