@@ -202,9 +202,17 @@ class RateLimiter:
             self._sleep(wait_time)
 
 
+# Round 10: burst raised 3 -> 10. The SUSTAINED rate is unchanged at 1 req/s,
+# so the load this places on the site is identical - but seat acquisition
+# fires 7 requests back to back, and with a burst of 3 the limiter was
+# throttling the one moment that matters. Measured on 2026-08-03: a
+# request-budget renewal took 10s wall-clock (08:07:52 -> 08:08:02) with
+# RATE_THROTTLED lines in the middle, despite the CAPTCHA being instant from
+# the pool. A burst of 10 lets a single acquisition through untouched while
+# the token bucket still refills at 1/s, so nothing sustained changes.
 _RATE_LIMITER = RateLimiter(
     rate_per_second=float(os.environ.get("MAX_REQUESTS_PER_SECOND", "1.0")),
-    burst=int(os.environ.get("REQUEST_BURST_ALLOWANCE", "3")),
+    burst=int(os.environ.get("REQUEST_BURST_ALLOWANCE", "10")),
 )
 
 
