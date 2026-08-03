@@ -692,14 +692,58 @@ def submit_booking(
     r.raise_for_status()
     seat.token = extract_token(r.text) or seat.token
 
-    soup = BeautifulSoup(r.text, HTML_PARSER)
+    return is_booking_confirmed(r.text, d), r.text
+
+
+def find_delete_link(html: str) -> Optional[str]:
+    """The confirmation page's `<a href="/en/delete?id=...">Delete</a>`.
+
+    Captured from a real confirmation page on 2026-08-02
+    (`probe_http_flow.py` with PROBE_BOOK=1): the delete action is a plain
+    link carrying a per-booking id. Its presence is the single most reliable
+    signal that a booking actually exists, because the site has no reason to
+    render one otherwise. Returned so the caller can store it - it is also
+    the fastest way for a human to cancel a superseded appointment.
+    """
+    m = re.search(r'href="(/[a-z]{2}/delete\?id=[^"]+)"', html)
+    return m.group(1) if m else None
+
+
+def is_booking_confirmed(html: str, date_ddmmyyyy: str) -> bool:
+    """Did this response confirm a booking?
+
+    Rewritten 2026-08-03 after a real live failure. On 2026-08-03 06:05 the
+    Playwright booker selected a genuine 10:15 slot, clicked submit, and then
+    reported `submit_uncertain` - leaving nobody able to say whether an
+    appointment existed. Two flaws caused that:
+
+      1. The markers were pure page text ("Booked time" / "Add new booking" /
+         "Delete"), which are English-locale strings on a site that also
+         serves Estonian, and one of them - the date marker - was formatted
+         as `2026.08.05` when the site renders `05.08.2026`, so it could
+         never match at all.
+      2. There was no NEGATIVE check, so "no positive marker found" was
+         indistinguishable from "the page said Booking failed".
+
+    Now: the structural delete link is the primary signal (see
+    find_delete_link), an explicit failure string is a hard negative that
+    overrides everything, and the text markers remain only as a secondary
+    positive. Getting this wrong in the optimistic direction is far worse
+    than in the pessimistic one - a false "confirmed" would stop the daemon
+    hunting for a booking that does not exist - so the failure string wins
+    any disagreement.
+    """
+    if find_delete_link(html):
+        return True
+    soup = BeautifulSoup(html, HTML_PARSER)
     text = soup.get_text(" ", strip=True)
-    confirmed = (
+    if "Booking failed" in text:
+        return False
+    return (
         "Booked time" in text
         or "Add new booking" in text
-        or (d in text and "Delete" in text)
+        or (date_ddmmyyyy in text and "Delete" in text)
     )
-    return confirmed, r.text
 
 
 # ---------------------------------------------------------------------------

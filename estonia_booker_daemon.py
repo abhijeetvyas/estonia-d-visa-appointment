@@ -66,6 +66,7 @@ from estonia_booking_http import (
     resolve_r17_refresh_dates,
     query_free_times,
     submit_booking,
+    find_delete_link,
 )
 
 # ---------------------------------------------------------------------------
@@ -287,18 +288,85 @@ def save_booked_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def is_already_booked() -> bool:
-    return bool(load_booked_state().get("booked"))
+def currently_booked_date() -> Optional[str]:
+    """The date (YYYY-MM-DD) of the best appointment currently held, or None.
 
-
-def mark_booked(details: dict) -> None:
+    Falls back to the legacy `booked: true` flag with no recorded date - a
+    state file written by the old Playwright booker before this change. In
+    that case we know a booking exists but not for when, so `should_book_date`
+    treats it conservatively.
+    """
     state = load_booked_state()
-    state["booked"] = True
+    d = state.get("booked_date")
+    if d:
+        return d
+    if state.get("booked"):
+        return state.get("booking_details", {}).get("date")
+    return None
+
+
+def should_book_date(candidate_iso: str) -> bool:
+    """Round-6: replaces the old permanent `is_already_booked()` gate.
+
+    The original design stopped booking forever once one appointment was
+    confirmed. The owner wants the opposite: keep hunting indefinitely, and
+    whenever a STRICTLY EARLIER date becomes bookable, take it - he deletes
+    the superseded appointment himself. So the gate is no longer "have we
+    booked?" but "would this be an improvement?".
+
+    Returns True if nothing is booked yet, or if `candidate_iso` is earlier
+    than what we already hold. Note `rank_dates()` has already excluded today
+    and past dates, so anything reaching here is a real future date.
+    """
+    held = currently_booked_date()
+    if not held:
+        return True
+    try:
+        return (
+            datetime.strptime(candidate_iso, "%Y-%m-%d").date()
+            < datetime.strptime(held, "%Y-%m-%d").date()
+        )
+    except ValueError:
+        # Unparseable stored date: refuse to rebook rather than risk churning
+        # bookings against a state file we cannot reason about. Visible in the
+        # log so it gets fixed rather than silently suppressing all rebooking.
+        log_line("INFO", f"Stored booked_date {held!r} is unparseable - not rebooking until it is fixed")
+        return False
+
+
+def mark_booked(details: dict) -> Optional[str]:
+    """Record a confirmed booking and return the date it superseded (if any),
+    so the caller can tell the owner which appointment to go and delete.
+
+    Keeps the legacy `booked: true` key so the old Playwright booker (which
+    shares this state file) still sees a booking exists, and appends to
+    `booking_history` so the full chain of improvements is auditable rather
+    than being overwritten each time.
+    """
+    state = load_booked_state()
+    previous = state.get("booked_date") or state.get("booking_details", {}).get("date")
+
+    state["booked"] = True  # legacy key - the old booker still reads this
+    state["booked_date"] = details.get("date")
+    state["booked_time"] = details.get("time")
     state["booked_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     state["booking_details"] = details
     state["booked_by"] = "estonia_booker_daemon"
+    history = state.get("booking_history", [])
+    history.append({
+        "at": state["booked_at"],
+        "date": details.get("date"),
+        "time": details.get("time"),
+        "superseded": previous,
+    })
+    state["booking_history"] = history
     save_booked_state(state)
-    log_line("BOOKING_SUCCESS", f"Persistent booked flag set: {details}")
+
+    if previous:
+        log_line("BOOKING_SUCCESS", f"Booked {details} - SUPERSEDES {previous}, which must be deleted manually")
+    else:
+        log_line("BOOKING_SUCCESS", f"Booked {details} (first booking). Still hunting for an earlier date.")
+    return previous
 
 
 # ---------------------------------------------------------------------------
@@ -554,15 +622,25 @@ from datetime import timedelta
 
 
 def rank_dates(available_dates: list[str]) -> list[str]:
-    """Returns available_dates ordered by booking preference:
-    1. Dates >= 3 days from today (R20), latest first.
-    2. Dates < 3 days from today, earliest first (R20's fallback).
-    Querying/booking in this order means the daemon naturally tries the
-    preferred date first, then falls back across every other date in
-    preference order before giving up (R22), all within a single poll cycle.
+    """Returns available_dates ordered by booking preference: EARLIEST FIRST,
+    excluding today and anything in the past.
+
+    Changed 2026-08-03 on the owner's instruction, replacing the original
+    R20/R21 rule ("latest date at least 3 days out, fall back to earliest").
+    Two separate reasons, both from him directly:
+
+      * The 3-day minimum was a comfort preference, not a requirement. Any
+        date that is not today works - tomorrow included.
+      * Earlier is strictly better. The system no longer stops after one
+        booking (see should_book_date): it keeps hunting and rebooks whenever
+        an EARLIER date appears, and he deletes the later one by hand. A
+        latest-first ordering would fight that goal on every cycle.
+
+    Today itself is excluded because a same-day appointment is not usefully
+    bookable - and past dates are excluded because the calendar has been
+    observed listing them.
     """
     today = datetime.now(timezone.utc).date()
-    min_date = today + timedelta(days=3)
 
     parsed = []
     for d in available_dates:
@@ -571,9 +649,8 @@ def rank_dates(available_dates: list[str]) -> list[str]:
         except ValueError:
             continue
 
-    good = sorted([(dt, s) for dt, s in parsed if dt >= min_date], key=lambda x: x[0], reverse=True)
-    fallback = sorted([(dt, s) for dt, s in parsed if dt < min_date], key=lambda x: x[0])
-    return [s for _, s in good] + [s for _, s in fallback]
+    usable = sorted([(dt, s) for dt, s in parsed if dt > today], key=lambda x: x[0])
+    return [s for _, s in usable]
 
 
 def choose_time(time_labels: list[str]) -> Optional[str]:
@@ -1090,8 +1167,13 @@ def attempt_booking(seat_mgr: SeatManager, date_iso: str, slot: Slot, elapsed_si
     check the booked flag right before every submit, not just at startup - a
     race against the old Playwright booker or a human is possible and this
     is the last line of defence against double-booking."""
-    if is_already_booked():
-        log_line("INFO", "Already booked (flag set) - skipping submit despite a found slot")
+    if not should_book_date(date_iso):
+        # Round-6: not "already booked" but "this would not be an
+        # improvement". Returning True stops this poll cycle's date loop,
+        # which is correct: rank_dates() is earliest-first, so every
+        # remaining date is later still.
+        held = currently_booked_date()
+        log_line("INFO", f"{date_iso} is not earlier than the held booking ({held}) - not rebooking")
         return True
 
     if DAEMON_DRY_RUN and _dry_run_completed.is_set():
@@ -1184,12 +1266,11 @@ def _finish_booking(seat_mgr: SeatManager, date_iso: str, slot: Slot, captcha_to
     way out (Fix 13), whether called synchronously (reserve had a token) or
     from the Fix-13 background thread (reserve was empty)."""
     try:
-        if is_already_booked():
-            # Re-check: a solve can take ~15-25s, during which another path
-            # (the old Playwright booker, a human, or - Fix 13 - a second
-            # attempt this one raced against, though booking_in_progress
-            # should have prevented that) may have already booked.
-            log_line("INFO", "Booked elsewhere while solving/waiting for a token - skipping this submit")
+        if not should_book_date(date_iso):
+            # Re-check after the wait: a solve takes ~15-25s, during which
+            # another path (the old Playwright booker, a human, or a raced
+            # second attempt) may have booked this date or something better.
+            log_line("INFO", f"{date_iso} stopped being an improvement while waiting for a token - skipping submit")
             return True
 
         if DAEMON_DRY_RUN:
@@ -1230,12 +1311,40 @@ def _finish_booking(seat_mgr: SeatManager, date_iso: str, slot: Slot, captcha_to
             return False
 
         if confirmed:
-            details = {"date": date_iso, "time": slot.time, "slot_id": slot.value, "embassy": EMBASSY_ID}
-            mark_booked(details)
-            send_telegram(
-                f"✅ BOOKED D-visa appointment for {EMBASSY_NAME}: {date_iso} at {slot.time}. "
-                f"~{elapsed_since_trigger:.1f}s from slot detection to submit.{RUNTIME_SIGNATURE}"
-            )
+            # Dump the confirmation page on SUCCESS too, not just on an
+            # unclear outcome. On 2026-08-03 a real submit produced an
+            # unverifiable result and there was no artifact of any kind to
+            # inspect afterwards; a confirmed booking is exactly when we most
+            # want a record of what the server actually said.
+            confirm_dump = dump_html(f"booking_confirmed_{EMBASSY_ID}", response_html)
+            delete_href = find_delete_link(response_html)
+            details = {
+                "date": date_iso, "time": slot.time, "slot_id": slot.value, "embassy": EMBASSY_ID,
+                "delete_url": (f"https://broneering.mfa.ee{delete_href}" if delete_href else None),
+                "confirmation_dump": confirm_dump,
+            }
+            previous = mark_booked(details)
+            took = f"~{elapsed_since_trigger:.1f}s from slot detection to submit." if elapsed_since_trigger else ""
+            if previous:
+                # Round-6: an improvement, not a first booking. The old
+                # appointment is still live on the portal and only the owner
+                # can remove it - so say so unmistakably rather than burying
+                # it in a generic success message.
+                send_telegram(
+                    f"✅ BOOKED AN EARLIER D-visa appointment at {EMBASSY_NAME}: "
+                    f"{date_iso} at {slot.time}.\n\n"
+                    f"⚠️ YOU NOW HOLD TWO APPOINTMENTS. Please delete the older one ({previous}) "
+                    f"on the portal yourself - this system cannot and will not delete it.\n\n"
+                    f"Cancel link for the NEW one (keep this, do not click it unless you want to undo): "
+                    f"{details.get('delete_url') or '(not found on the page)'}\n\n"
+                    f"Still hunting for anything earlier than {date_iso}. {took}{RUNTIME_SIGNATURE}"
+                )
+            else:
+                send_telegram(
+                    f"✅ BOOKED D-visa appointment for {EMBASSY_NAME}: {date_iso} at {slot.time}. {took}\n\n"
+                    f"The daemon keeps running and will automatically rebook if an EARLIER date "
+                    f"appears - you would then delete this one manually.{RUNTIME_SIGNATURE}"
+                )
             return True
         else:
             # Spec §8: "Booking submitted, confirmation unclear -> Do NOT set
@@ -1448,8 +1557,9 @@ def handle_seat_death(seat_mgr: "SeatManager", exc: SeatDeadError, where: str,
         elapsed_since_trigger,
     )
     seat_mgr.drop_seat()
-    if not is_already_booked():
-        seat_mgr.begin_background_acquire(reason="seat_died")
+    # Round-6: always replace. The daemon no longer stops after a booking -
+    # it keeps hunting for an earlier date indefinitely.
+    seat_mgr.begin_background_acquire(reason="seat_died")
 
 
 # ---------------------------------------------------------------------------
@@ -1481,9 +1591,6 @@ def poll_cycle(seat_mgr: SeatManager, elapsed_since_trigger: Optional[float]) ->
     seat = seat_mgr.seat
     if seat is None:
         return False
-
-    if is_already_booked():
-        return True  # R25: stop polling for booking purposes once booked
 
     any_slots_this_cycle = False
     for date_iso in rank_dates(seat.available_dates):
@@ -1645,9 +1752,9 @@ def main() -> int:
                     # freshness and "how long has this episode been running"
                     # are different questions.
                     seat_mgr.last_trigger_ts = new_trigger_ts
-                    if not seat_mgr.has_live_seat() and not is_already_booked():
+                    if not seat_mgr.has_live_seat():
                         seat_mgr.acquire(elapsed_since_trigger=elapsed)
-                    elif seat_mgr.has_live_seat() and not is_already_booked():
+                    elif seat_mgr.has_live_seat():
                         # A NEW trigger arrived while a seat is already live -
                         # opportunistically refresh the date list sooner than
                         # the periodic DATE_REFRESH_INTERVAL_SECONDS cadence,

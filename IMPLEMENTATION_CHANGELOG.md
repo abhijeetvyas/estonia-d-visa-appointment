@@ -850,3 +850,110 @@ guard rather than the cooldown, and the test would pass for the wrong reason.
   `SEAT_RENEWING reason=request_budget(...)` firing at ~130s with **no** `SEAT_DIED` at all. If
   `SEAT_DIED` still appears, the ceiling is lower than 100 for that session and the threshold needs
   lowering.
+
+## 12. Round 6 (2026-08-03) — behaviour changes requested by the owner, plus the confirmation-check fix
+
+Implemented by: Claude (Opus, Cowork session), directly. Branch: `gcp-daemon`.
+
+Triggered by two real availability events this morning that were both handled by the **old
+Playwright booker**, because the daemon had never been deployed (no systemd unit existed). One of
+those events exposed a bug worse than slowness.
+
+### 12.1 The 06:05 event — we submitted a real booking and could not tell whether it worked
+
+```
+06:05:35  Available dates: ['2026-08-05']
+06:05:37  Time slots for 2026-08-05: ['10:15']
+06:05:37  Time selection result: True (wanted 10:15)
+06:05:39  Clicking final 'Book the appointment' (broneeri)
+06:05:43  Final submit clicked but confirmation markers not found  -> submit_uncertain
+```
+
+A real slot was found and submitted with real applicant data. The owner checked: **no booking was
+created.** But the system could not have told him either way, and left no artifact. Two flaws in
+the confirmation check:
+
+1. One marker was `selected_date.replace("-", ".")` → `"2026.08.05"`. The site renders
+   `05.08.2026`. That marker could never match.
+2. No negative check, so "no positive marker" was indistinguishable from the page saying
+   `"Booking failed"`.
+
+Fixed in both codebases. The primary signal is now the structural delete link
+(`<a href="/en/delete?id=...">`, captured from a real confirmation page on 2026-08-02);
+`"Booking failed"` is a hard negative that overrides everything; the text markers survive only as
+a secondary positive. `find_delete_link()` also returns the cancel URL, which is now stored with
+the booking and included in the success Telegram. The post-submit page is now dumped on **success
+as well as failure** — on 06:05 there was no artifact of any kind to inspect.
+
+Bias is deliberately pessimistic: a false "confirmed" would stop the hunt for a booking that does
+not exist, which is far worse than a false "unclear".
+
+### 12.2 The 06:48 event — the 90s cooldown ate the rest of the episode
+
+```
+06:49:33  Booker under cooldown (83s remaining) - exiting
+06:49:43  Booker under cooldown (73s remaining) - exiting
+06:49:53  Booker under cooldown (63s remaining) - exiting
+```
+
+D-visa was still being advertised while the booker refused to run. `BOOKER_COOLDOWN_SECONDS`
+default changed **90 → 0**. It was added to prevent stampeding when a slot stayed open for
+minutes, but episodes only last ~90–110s (F9), so it reliably burned the remainder of an episode
+after one failed attempt. Overlapping processes are still prevented by the lock file, which is the
+mechanism that actually does that job. The daemon never had a booking cooldown; its remaining
+cooldowns (`SEAT_DEATH_REACQUIRE_COOLDOWN_SECONDS`, `REACQUIRE_COOLDOWN_SECONDS`) bound CAPTCHA
+spend on abnormal reacquisition and do not delay booking.
+
+### 12.3 Date preference: earliest, not "latest ≥3 days out"
+
+Owner's instruction: the 3-day minimum was a comfort preference, not a requirement — any date from
+tomorrow onwards is fine. Combined with 12.4, earlier is now strictly better, so a latest-first
+ordering would have fought the goal on every cycle.
+
+`rank_dates()` (daemon) and `choose_date()` (old booker) now return **earliest first, excluding
+today and any past date**. Today is excluded because a same-day appointment is not usefully
+bookable; past dates because the calendar has been observed listing them.
+
+### 12.4 The permanent "booked" flag is gone — the hunt never stops
+
+Previously one confirmed booking set `booked: true` and disabled all further booking forever.
+Owner's instruction: keep hunting, and take any **strictly earlier** date; he deletes the
+superseded appointment himself.
+
+- `is_already_booked()` → **`should_book_date(candidate)`**: true if nothing is held, or the
+  candidate is earlier than what is held. Same date or later → no rebooking, so there is no churn.
+- `mark_booked()` records `booked_date`, `booked_time`, `delete_url`, and appends to
+  `booking_history` (the chain of improvements is auditable rather than overwritten). It returns
+  the superseded date so the caller can name it.
+- The success Telegram now says, unmistakably, that **two appointments are held** and which one
+  the owner must delete — including the cancel URL for the new one.
+- All the "stop once booked" gates are gone: seat death always triggers a replacement, the poll
+  loop no longer short-circuits, and the main loop keeps acquiring seats.
+- The legacy `booked: true` key is still written, because the old Playwright booker shares
+  `.state/booker_state_<EMBASSY_ID>.json`. Both files were updated together, and both read a
+  legacy state file's `booking_details.date` when `booked_date` is absent.
+
+**Deliberately not automated:** deleting the superseded appointment. The owner asked to do that
+himself, and an automated delete that misfires would destroy a real appointment with no way back.
+
+### 12.5 Tests
+
+`python3 test_daemon_units.py` — **85 checks, all passed** (was 70). New coverage: earliest-first
+ordering, today/past exclusion, the 3-day rule being gone, the `should_book_date` improvement gate
+including legacy and unparseable state, and eight cases for `is_booking_confirmed` — among them an
+explicit regression test that the old broken `2026.08.05` marker no longer produces a false
+positive.
+
+One existing test was **inverted on purpose**: "once booked, a dying seat is dropped but NOT
+replaced" is now "a dying seat is replaced even while holding a booking". Under round 6 the old
+assertion would have meant the daemon stopped looking for an earlier date the moment the first
+booking landed.
+
+`git diff --stat estonia_visa_monitor.py` — empty. R1 still holds.
+
+### 12.6 Still outstanding
+
+- **The daemon has never run in live mode against New Delhi.** No systemd unit is installed. This
+  remains the single largest gap and is the reason today's events were handled by the old booker.
+- **No `SEAT_DIED` dump has been captured** (round 5's Fix 18 instrumentation).
+- **R17 is still unverified** — whether the step-4 replay genuinely refreshes the date list.

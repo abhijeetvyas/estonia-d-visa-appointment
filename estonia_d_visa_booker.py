@@ -89,7 +89,15 @@ LOCK_FILE = Path(f"/tmp/estonia_d_visa_booker_{EMBASSY_ID}.lock")
 
 # Cooldown after a booker run finishes (success or failure) before another
 # launch is allowed.  Prevents stampeding when a slot stays open for minutes.
-BOOKER_COOLDOWN_SECONDS = int(os.environ.get("BOOKER_COOLDOWN_SECONDS", "90"))
+# Changed 2026-08-03 (owner's instruction): default 90 -> 0. The cooldown was
+# added to stop the booker stampeding while a slot stayed open for minutes,
+# but availability episodes only last ~90-110s (F9), so a 90s cooldown burned
+# most of an episode after a single failed attempt. Real production evidence:
+# on 2026-08-03 at 06:49:33, 06:49:43 and 06:49:53 the booker logged "under
+# cooldown - exiting" while D-visa was still being advertised. Concurrency is
+# still bounded by the lock file, which is the mechanism that actually
+# prevents overlapping Playwright processes.
+BOOKER_COOLDOWN_SECONDS = int(os.environ.get("BOOKER_COOLDOWN_SECONDS", "0"))
 
 # How long the lock is considered stale (crash protection)
 LOCK_STALE_SECONDS = 180
@@ -251,13 +259,59 @@ def is_already_booked() -> bool:
     return bool(load_state().get("booked"))
 
 
-def mark_booked(details: dict) -> None:
+def currently_booked_date() -> str | None:
+    """Date of the best appointment currently held, or None. Shares
+    `.state/booker_state_<EMBASSY_ID>.json` with estonia_booker_daemon.py, so
+    the two must agree on its shape - see that file's equivalent function."""
     state = load_state()
+    d = state.get("booked_date")
+    if d:
+        return d
+    if state.get("booked"):
+        return (state.get("booking_details") or {}).get("date")
+    return None
+
+
+def should_book_date(candidate_iso: str) -> bool:
+    """Round-6 (2026-08-03): replaces the permanent "stop once booked" gate.
+
+    The owner wants the hunt to continue indefinitely and an EARLIER date to
+    be taken whenever one appears - he deletes the superseded appointment
+    himself. So the question is no longer "have we booked?" but "would this
+    be an improvement?".
+    """
+    held = currently_booked_date()
+    if not held:
+        return True
+    try:
+        return (
+            datetime.strptime(candidate_iso, "%Y-%m-%d").date()
+            < datetime.strptime(held, "%Y-%m-%d").date()
+        )
+    except ValueError:
+        return False
+
+
+def mark_booked(details: dict) -> str | None:
+    """Records a confirmed booking and returns the date it superseded, if any.
+    Same state shape as estonia_booker_daemon.py's mark_booked()."""
+    state = load_state()
+    previous = state.get("booked_date") or (state.get("booking_details") or {}).get("date")
     state["booked"] = True
+    state["booked_date"] = details.get("date")
+    state["booked_time"] = details.get("time")
     state["booked_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     state["booking_details"] = details
+    state["booked_by"] = "estonia_d_visa_booker"
+    history = state.get("booking_history", [])
+    history.append({
+        "at": state["booked_at"], "date": details.get("date"),
+        "time": details.get("time"), "superseded": previous,
+    })
+    state["booking_history"] = history
     save_state(state)
-    log_line(f"Persistent booked flag set: {details}")
+    log_line(f"Booked {details}" + (f" - SUPERSEDES {previous}, delete it manually" if previous else ""))
+    return previous
 
 
 def acquire_lock() -> bool:
@@ -580,31 +634,33 @@ def parse_time(t: str) -> tuple[int, int]:
 
 def choose_date(available_dates: list[str]) -> str | None:
     """
-    Prefer the latest date that is at least 3 days from today (UTC).
-    Fallback to the earliest available date if none satisfy the rule.
+    EARLIEST available date that is not today. Changed 2026-08-03 on the
+    owner's instruction, replacing "latest date at least 3 days out".
+
+    The 3-day minimum was a comfort preference, not a requirement - any date
+    from tomorrow onwards is acceptable. And earlier is now strictly better,
+    because the system no longer stops after one booking: it keeps hunting
+    and rebooks whenever an earlier date appears (see should_book_date), with
+    the superseded appointment deleted by hand. Preferring the latest date
+    would work directly against that.
+
+    Today is excluded (a same-day appointment is not usefully bookable), as
+    are past dates, which the calendar has been observed listing.
     """
     if not available_dates:
         return None
     today = datetime.now(timezone.utc).date()
-    min_date = today + timedelta(days=3)
 
     candidates = []
     for d in available_dates:
         try:
             dt = datetime.strptime(d, "%Y-%m-%d").date()
-            candidates.append((dt, d))
+            if dt > today:
+                candidates.append((dt, d))
         except ValueError:
             continue
     if not candidates:
         return None
-
-    good = [(dt, s) for dt, s in candidates if dt >= min_date]
-    if good:
-        # latest among those ≥ 3 days away
-        good.sort(key=lambda x: x[0], reverse=True)
-        return good[0][1]
-
-    # fallback: earliest available
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
 
@@ -684,7 +740,10 @@ def get_recaptcha_token(
 
 def run_booker() -> dict:
     applicant = load_applicant_data()
-    list_only = FORCE_LIST_ONLY or is_already_booked()
+    # Round-6: no longer "stop forever once booked". list_only is decided
+    # per-date later (should_book_date); here it only reflects an explicit
+    # FORCE_LIST_ONLY request.
+    list_only = FORCE_LIST_ONLY
     mode = "DRY_RUN" if DRY_RUN else ("LIST_ONLY" if list_only else "LIVE_BOOK")
     log_line(f"Booker starting mode={mode} embassy={EMBASSY_ID}/{EMBASSY_NAME}")
 
@@ -937,6 +996,15 @@ def run_booker() -> dict:
                 result["message"] = "Could not choose a date from available list"
                 return result
             log_line(f"Chosen date: {selected_date}")
+
+            # Round-6 (2026-08-03): the "stop forever once booked" gate is
+            # gone; the question is now whether THIS date is an improvement
+            # on whatever we already hold. Evaluated here, after the date is
+            # known, rather than once at startup.
+            if not (DRY_RUN or FORCE_LIST_ONLY) and not should_book_date(selected_date):
+                held = currently_booked_date()
+                log_line(f"{selected_date} is not earlier than the held booking ({held}) - listing only, not rebooking")
+                list_only = True
 
             # Diagnostic for the leading `no_time_slots` hypothesis: the
             # manual day-click fallback (used whenever `input._flatpickr` is
@@ -1339,13 +1407,41 @@ def run_booker() -> dict:
 
             # Heuristic success check
             page_text = page.inner_text("body")
-            confirmation_markers = [
-                "Booked time",
-                "Add new booking",
-                "Delete",
-                selected_date.replace("-", "."),  # 18.08.2026 style
-            ]
-            success = any(m in page_text for m in confirmation_markers)
+            # Rewritten 2026-08-03 after this exact check failed on a real
+            # booking. At 06:05 the booker selected a genuine 10:15 slot,
+            # clicked submit, and reported `submit_uncertain` - leaving nobody
+            # able to say whether an appointment existed. Two flaws:
+            #   1. `selected_date.replace("-", ".")` produces "2026.08.05",
+            #      but the site renders "05.08.2026" - that marker could
+            #      never match.
+            #   2. No negative check, so "no marker found" was
+            #      indistinguishable from the page saying "Booking failed".
+            # The structural delete link (`<a href="/en/delete?id=...">`,
+            # captured from a real confirmation page on 2026-08-02) is the
+            # reliable signal; the failure string is a hard override.
+            page_html = page.content()
+            dmy = datetime.strptime(selected_date, "%Y-%m-%d").strftime("%d.%m.%Y")
+            has_delete_link = bool(re.search(r'href="/[a-z]{2}/delete\?id=[^"]+"', page_html))
+            if has_delete_link:
+                success = True
+            elif "Booking failed" in page_text:
+                success = False
+            else:
+                success = any(m in page_text for m in ("Booked time", "Add new booking")) or (
+                    dmy in page_text and "Delete" in page_text
+                )
+            log_line(f"Confirmation check: delete_link={has_delete_link} success={success}")
+            if not DRY_RUN:
+                # Always keep the post-submit page, success or not - on
+                # 2026-08-03 there was no artifact of any kind to inspect
+                # afterwards, which is why the outcome stayed unknown.
+                try:
+                    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+                    _p = SCREENSHOT_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_after_submit_{EMBASSY_ID}.html"
+                    _p.write_text(page_html, encoding="utf-8")
+                    log_line(f"Post-submit page saved: {_p}")
+                except Exception as _e:
+                    log_line(f"Could not save post-submit page: {_e}", file=sys.stderr)
 
             if DRY_RUN:
                 # DRY_RUN now performs a REAL submit against the live site (using
@@ -1438,13 +1534,20 @@ def run_booker() -> dict:
                     "time": selected_time,
                     "embassy": EMBASSY_NAME,
                 }
-                mark_booked(details)
+                previous = mark_booked(details)
                 msg = (
                     f"✅ BOOKED – Estonia D-visa appointment\n\n"
                     f"Embassy: {EMBASSY_NAME}\n"
                     f"Date: {selected_date}\n"
                     f"Time: {selected_time}\n\n"
-                    f"Check your email / the booking portal for confirmation."
+                    + (
+                        f"⚠️ YOU NOW HOLD TWO APPOINTMENTS. Delete the older one ({previous}) "
+                        f"on the portal yourself - this system will not.\n\n"
+                        if previous else
+                        "Still hunting: if an EARLIER date appears it will be booked too, and you "
+                        "would then delete this one manually.\n\n"
+                    )
+                    + f"Check your email / the booking portal for confirmation."
                     f"{RUNTIME_SIGNATURE}"
                 )
                 send_telegram(msg)

@@ -69,44 +69,118 @@ class FakeClock:
 
 
 def main() -> int:
-    # --- rank_dates(): R20 preference (latest date >=3 days out first) ---
+    # --- rank_dates(): round-6 - EARLIEST first, today and past excluded ---
+    # Replaced R20's "latest date >=3 days out". Earlier is now strictly
+    # better because the daemon rebooks whenever an earlier date appears.
     dates = [iso(1), iso(4), iso(10), iso(2)]
     ranked = daemon.rank_dates(dates)
     check(
-        "rank_dates: latest >=3-day-out date ranked first",
-        ranked[0] == iso(10),
+        "rank_dates: earliest future date ranked first (was: latest >=3 days out)",
+        ranked[0] == iso(1),
         f"got {ranked}",
     )
     check(
-        "rank_dates: all 4 input dates present in output (no silent drops)",
-        sorted(ranked) == sorted(dates),
+        "rank_dates: full ascending ordering, so the poll loop walks every date nearest-first (R22)",
+        ranked == [iso(1), iso(2), iso(4), iso(10)],
         f"got {ranked}",
     )
-
-    # --- rank_dates(): R20 fallback when nothing is >=3 days out ---
-    near_only = [iso(0), iso(1), iso(2)]
-    ranked_near = daemon.rank_dates(near_only)
     check(
-        "rank_dates: fallback to earliest-first when no date is >=3 days out",
-        ranked_near[0] == iso(0),
-        f"got {ranked_near}",
+        "rank_dates: the old 3-day minimum is gone - tomorrow is acceptable",
+        daemon.rank_dates([iso(1)]) == [iso(1)],
+        f"got {daemon.rank_dates([iso(1)])}",
     )
-
-    # --- rank_dates(): R22 - a full ordering across ALL dates, not just top pick ---
-    # This is what lets the polling loop try every other date in one cycle
-    # before giving up, per R22, rather than picking one date and stopping.
-    mixed = [iso(0), iso(15), iso(1), iso(20), iso(2)]
-    ranked_mixed = daemon.rank_dates(mixed)
     check(
-        "rank_dates: R22 full ordering - good dates (>=3d out) descending, then fallback ascending",
-        ranked_mixed == [iso(20), iso(15), iso(0), iso(1), iso(2)],
-        f"got {ranked_mixed}",
+        "rank_dates: TODAY is excluded (a same-day appointment is not usefully bookable)",
+        daemon.rank_dates([iso(0), iso(3)]) == [iso(3)],
+        f"got {daemon.rank_dates([iso(0), iso(3)])}",
     )
-
-    # --- rank_dates(): malformed entries are skipped, not fatal ---
+    check(
+        "rank_dates: past dates are excluded (the calendar has been seen listing them)",
+        daemon.rank_dates([iso(-5), iso(2)]) == [iso(2)],
+        f"got {daemon.rank_dates([iso(-5), iso(2)])}",
+    )
     check(
         "rank_dates: malformed date strings are silently skipped",
         daemon.rank_dates(["not-a-date", iso(10)]) == [iso(10)],
+    )
+
+    # --- should_book_date(): round-6 improvement gate ----------------------
+    # The permanent "stop once booked" flag is gone: the daemon keeps hunting
+    # and takes any STRICTLY EARLIER date, leaving the owner to delete the
+    # superseded appointment.
+    real_load = daemon.load_booked_state
+    try:
+        daemon.load_booked_state = lambda: {}
+        check(
+            "should_book_date: nothing booked yet -> book anything",
+            daemon.should_book_date(iso(9)) is True,
+        )
+
+        daemon.load_booked_state = lambda: {"booked": True, "booked_date": iso(10)}
+        check(
+            "should_book_date: an EARLIER date than the one held -> rebook",
+            daemon.should_book_date(iso(3)) is True,
+        )
+        check(
+            "should_book_date: a LATER date than the one held -> do not rebook",
+            daemon.should_book_date(iso(20)) is False,
+        )
+        check(
+            "should_book_date: the SAME date as the one held -> do not rebook (no churn)",
+            daemon.should_book_date(iso(10)) is False,
+        )
+
+        # Legacy state written by the old Playwright booker, before
+        # booked_date existed: the date lives under booking_details.
+        daemon.load_booked_state = lambda: {"booked": True, "booking_details": {"date": iso(10)}}
+        check(
+            "should_book_date: reads a legacy state file's booking_details.date",
+            daemon.should_book_date(iso(4)) is True and daemon.should_book_date(iso(14)) is False,
+        )
+
+        daemon.load_booked_state = lambda: {"booked": True, "booked_date": "garbage"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            unparseable = daemon.should_book_date(iso(4))
+        check(
+            "should_book_date: an unparseable stored date refuses to rebook rather than churning",
+            unparseable is False,
+        )
+    finally:
+        daemon.load_booked_state = real_load
+
+    # --- is_booking_confirmed(): rewritten after the 2026-08-03 failure ----
+    dmy = "05.08.2026"
+    check(
+        "is_booking_confirmed: a /en/delete?id= link is the primary positive signal",
+        http_flow.is_booking_confirmed('<a href="/en/delete?id=6a6ecc0761de0">Delete</a>', dmy) is True,
+    )
+    check(
+        "find_delete_link: returns the href so the cancel URL can be stored",
+        http_flow.find_delete_link('<a href="/en/delete?id=abc123">Delete</a>') == "/en/delete?id=abc123",
+    )
+    check(
+        "is_booking_confirmed: 'Booking failed' is a hard negative",
+        http_flow.is_booking_confirmed("<p>Booking failed</p>", dmy) is False,
+    )
+    check(
+        "is_booking_confirmed: 'Booking failed' overrides a stray text marker",
+        http_flow.is_booking_confirmed("<p>Booking failed. Add new booking</p>", dmy) is False,
+    )
+    check(
+        "is_booking_confirmed: text markers still work as a secondary positive",
+        http_flow.is_booking_confirmed("<p>Booked time 10:15</p>", dmy) is True,
+    )
+    check(
+        "is_booking_confirmed: the date marker uses DD.MM.YYYY, the format the site actually renders",
+        http_flow.is_booking_confirmed(f"<p>{dmy} Delete</p>", dmy) is True,
+    )
+    check(
+        "is_booking_confirmed: the OLD broken marker (2026.08.05) no longer produces a false positive",
+        http_flow.is_booking_confirmed("<p>2026.08.05 something</p>", dmy) is False,
+    )
+    check(
+        "is_booking_confirmed: an unrelated page is not confirmed",
+        http_flow.is_booking_confirmed("<p>Choose the representation</p>", dmy) is False,
     )
 
     # --- choose_time(): R21 preference for 12:00-14:00 ---
@@ -522,7 +596,7 @@ def main() -> int:
     real_establish_seat = daemon.establish_seat
     real_load_applicant_data = daemon.load_applicant_data
     real_cache_applicant = daemon.cache_applicant_on_seat
-    real_is_already_booked = daemon.is_already_booked
+    real_should_book = daemon.should_book_date
     real_mark_booked = daemon.mark_booked
     real_send_telegram = daemon.send_telegram
     real_submit_booking = daemon.submit_booking
@@ -686,7 +760,7 @@ def main() -> int:
 
     daemon.solve_on_demand = slow_solve_on_demand
     daemon.submit_booking = fake_submit_booking
-    daemon.is_already_booked = lambda: False
+    daemon.should_book_date = lambda d: True
     daemon.mark_booked = lambda details: None
     daemon.send_telegram = lambda msg: None
     daemon.load_applicant_data = lambda: {"specifying_information": "x"}
@@ -740,7 +814,7 @@ def main() -> int:
     finally:
         daemon.solve_on_demand = real_solve_on_demand
         daemon.submit_booking = real_submit_booking
-        daemon.is_already_booked = real_is_already_booked
+        daemon.should_book_date = real_should_book
         daemon.mark_booked = real_mark_booked
         daemon.send_telegram = real_send_telegram
         daemon.load_applicant_data = real_load_applicant_data
@@ -753,7 +827,7 @@ def main() -> int:
     daemon._dry_run_completed.clear()
     real_dry_run = daemon.DAEMON_DRY_RUN
     daemon.DAEMON_DRY_RUN = True
-    daemon.is_already_booked = lambda: False
+    daemon.should_book_date = lambda d: True
     daemon.solve_on_demand = lambda timeout=120: "FAKE_DRY_RUN_TOKEN"
     telegram_msgs: list[str] = []
     daemon.send_telegram = lambda msg: telegram_msgs.append(msg)
@@ -781,7 +855,7 @@ def main() -> int:
         )
     finally:
         daemon.DAEMON_DRY_RUN = real_dry_run
-        daemon.is_already_booked = real_is_already_booked
+        daemon.should_book_date = real_should_book
         daemon.solve_on_demand = real_solve_on_demand
         daemon.send_telegram = real_send_telegram
         daemon._dry_run_completed.clear()
@@ -914,12 +988,12 @@ def main() -> int:
     dumped: list[str] = []
     real_begin_bg = daemon.SeatManager.begin_background_acquire
     real_dump = daemon.dump_html
-    real_booked = daemon.is_already_booked
+    real_booked = daemon.should_book_date
     daemon.SeatManager.begin_background_acquire = (
         lambda self, reason: (acquire_calls.append(reason) or True)
     )
     daemon.dump_html = lambda name, html: (dumped.append((name, html)) or "/tmp/fake_dump.html")
-    daemon.is_already_booked = lambda: False
+    daemon.should_book_date = lambda d: True
     try:
         mgr = daemon.SeatManager()
         s = http_flow.new_session()
@@ -945,9 +1019,13 @@ def main() -> int:
             f"seat={mgr.seat} acquire_calls={acquire_calls}",
         )
 
-        # Already-booked must not trigger pointless reacquisition.
+        # Round-6 changed this deliberately: holding a booking no longer
+        # stops the hunt, so a dying seat is ALWAYS replaced. Previously this
+        # asserted the opposite (no replacement once booked), which would now
+        # mean the daemon stopped looking for an earlier date the moment the
+        # first booking landed - exactly what the owner asked us not to do.
         acquire_calls.clear()
-        daemon.is_already_booked = lambda: True
+        daemon.should_book_date = lambda d: False  # i.e. we already hold something better
         mgr.seat = http_flow.Seat(
             session=http_flow.new_session(), embassy_id="244", token="tok",
             established_at=time_module.time(), available_dates=[], last_seen_dates=[],
@@ -955,14 +1033,14 @@ def main() -> int:
         with contextlib.redirect_stdout(io.StringIO()):
             daemon.handle_seat_death(mgr, exc, "whatever", None)
         check(
-            "Fix 17: once booked, a dying seat is dropped but NOT replaced",
-            mgr.seat is None and acquire_calls == [],
+            "Round-6: a dying seat is replaced even while holding a booking (the hunt never stops)",
+            mgr.seat is None and acquire_calls == ["seat_died"],
             f"acquire_calls={acquire_calls}",
         )
     finally:
         daemon.SeatManager.begin_background_acquire = real_begin_bg
         daemon.dump_html = real_dump
-        daemon.is_already_booked = real_booked
+        daemon.should_book_date = real_booked
 
     # --- Fix 17: the short death cooldown stops a tight spin ----------------
     spawned: list[str] = []
