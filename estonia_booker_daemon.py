@@ -1731,6 +1731,25 @@ def main() -> int:
                         trigger = self_trigger
                         trigger_watcher.last_seen_ts = self_trigger["ts"]
 
+                # Round-6b: discard a trigger file left over from a PREVIOUS
+                # episode before acting on it. On 2026-08-03 07:20:21 the
+                # daemon started up, read a 209-second-old trigger, tried to
+                # acquire a seat, and got "D-visa not currently offered" -
+                # that episode had ended four minutes earlier. Harmless then,
+                # but it would waste a CAPTCHA the moment the timing lined up
+                # differently. Filtered here, before the handling block, so
+                # nothing downstream has to cope with a half-processed trigger.
+                if trigger is not None:
+                    _age = time.time() - trigger["ts"]
+                    if _age > TRIGGER_FRESH_WINDOW_SECONDS:
+                        log_line(
+                            "INFO",
+                            f"Ignoring stale trigger ({_age:.0f}s old, older than "
+                            f"TRIGGER_FRESH_WINDOW_SECONDS={TRIGGER_FRESH_WINDOW_SECONDS:.0f})",
+                        )
+                        seat_mgr.last_trigger_ts = trigger["ts"]
+                        trigger = None
+
                 if trigger is not None:
                     new_trigger_ts = trigger["ts"]
                     # Fix 15: figure out episode boundaries BEFORE
