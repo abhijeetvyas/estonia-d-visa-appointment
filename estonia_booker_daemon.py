@@ -160,7 +160,19 @@ TOKEN_RESERVE_SIZE = int(os.environ.get("TOKEN_RESERVE_SIZE", "2"))
 # no-op unless a token was consumed or aged out, so this governs how quickly
 # a gap is noticed, not how often anything is spent.
 TOKEN_POOL_CHECK_INTERVAL_SECONDS = float(os.environ.get("TOKEN_POOL_CHECK_INTERVAL_SECONDS", "5"))
-CAPSOLVER_LOW_BALANCE_USD = float(os.environ.get("CAPSOLVER_LOW_BALANCE_USD", "2.00"))  # R32
+# Round 9 (owner's request): alert below $1, and REPEAT hourly while it stays
+# low. A single alert is easy to miss, and an empty balance silently reverts
+# the daemon to solving on demand at every step - slower than before the pool
+# existed - with no further warning.
+CAPSOLVER_LOW_BALANCE_USD = float(os.environ.get("CAPSOLVER_LOW_BALANCE_USD", "1.00"))  # R32
+LOW_BALANCE_REALERT_SECONDS = float(os.environ.get("LOW_BALANCE_REALERT_SECONDS", "3600"))
+
+# Round 9 (owner's request): Telegram the available time slots as they are
+# seen. Sent on CHANGE, not on every poll - SLOT_FOUND fires every 2s while a
+# seat is parked (80+ times in a 3-minute test run), so an unconditional send
+# would be pure spam and would bury the messages that matter. A minimum
+# interval guards against a slot list that flaps between two states.
+SLOTS_NOTIFY_MIN_INTERVAL_SECONDS = float(os.environ.get("SLOTS_NOTIFY_MIN_INTERVAL_SECONDS", "30"))
 
 DAEMON_DRY_RUN = os.environ.get("DAEMON_DRY_RUN", "").lower() in ("1", "true", "yes")  # R26
 DAEMON_SELF_DETECT = os.environ.get("DAEMON_SELF_DETECT", "").lower() in ("1", "true", "yes")  # R8, opt-in, default off
@@ -618,6 +630,49 @@ def solve_on_demand(timeout: int = 120) -> str:
 # CapSolver balance monitoring (R32)
 # ---------------------------------------------------------------------------
 
+_last_low_balance_alert_ts: float = 0.0
+
+# Round 9: what slot list we last told the owner about, and when.
+_last_slots_signature: str = ""
+_last_slots_notify_ts: float = 0.0
+
+
+def notify_available_slots(date_iso: str, times: list, held: Optional[str]) -> None:
+    """Telegram the currently-visible time slots for a date.
+
+    Deliberately change-driven. While a seat is parked the poll loop produces
+    a SLOT_FOUND every 2 seconds - during the 2026-08-03 T7 run that was 80+
+    identical results in three minutes. Sending each one would make the
+    channel useless precisely when a real booking message needs to stand out.
+    So: send when the (date, times) signature changes, and never more often
+    than SLOTS_NOTIFY_MIN_INTERVAL_SECONDS.
+    """
+    global _last_slots_signature, _last_slots_notify_ts
+    signature = f"{date_iso}:{','.join(times)}"
+    now = time.time()
+    if signature == _last_slots_signature:
+        return
+    if (now - _last_slots_notify_ts) < SLOTS_NOTIFY_MIN_INTERVAL_SECONDS:
+        return
+    _last_slots_signature = signature
+    _last_slots_notify_ts = now
+
+    if held:
+        tail = (
+            f"\n\nYou currently hold {held}. These will only be booked if the date is "
+            f"EARLIER than that."
+        )
+    else:
+        tail = "\n\nNothing booked yet - the earliest of these is being attempted now."
+    try:
+        send_telegram(
+            f"🕒 Slots visible at {EMBASSY_NAME} — {date_iso}\n\n"
+            f"{', '.join(times) if times else '(none)'}{tail}{RUNTIME_SIGNATURE}"
+        )
+    except Exception as e:
+        log_line("INFO", f"Slot-availability Telegram failed (non-fatal): {e}")
+
+
 def check_capsolver_balance() -> None:
     if not CAPSOLVER_API_KEY:
         return
@@ -635,13 +690,28 @@ def check_capsolver_balance() -> None:
             return
         log_line("INFO", f"CapSolver balance: ${balance:.2f}")
         if balance < CAPSOLVER_LOW_BALANCE_USD:
+            global _last_low_balance_alert_ts
             log_line("BALANCE_LOW", f"CapSolver balance ${balance:.2f} below threshold ${CAPSOLVER_LOW_BALANCE_USD:.2f}")
-            send_telegram(
-                f"⚠️ CapSolver balance is ${balance:.2f}, below the "
-                f"${CAPSOLVER_LOW_BALANCE_USD:.2f} alert threshold. The booker "
-                f"daemon for {EMBASSY_NAME} will stop being able to solve CAPTCHAs "
-                f"once this runs out - top up soon.{RUNTIME_SIGNATURE}"
-            )
+            # Round 9: repeat hourly rather than once. The balance check runs
+            # every 15 minutes, so without this gate a low balance would
+            # either alert four times an hour or (as before) exactly once and
+            # then go quiet while the daemon quietly degrades.
+            if (time.time() - _last_low_balance_alert_ts) >= LOW_BALANCE_REALERT_SECONDS:
+                _last_low_balance_alert_ts = time.time()
+                hours_left = balance / 0.05 if balance > 0 else 0  # ~$0.05/hr at a 2-token pool
+                send_telegram(
+                    f"⚠️ CapSolver balance is ${balance:.2f} (below ${CAPSOLVER_LOW_BALANCE_USD:.2f}).\n\n"
+                    f"At the current pool cost of roughly $0.05/hour that is about "
+                    f"{hours_left:.0f} hours of runway.\n\n"
+                    f"When it runs out the daemon does not stop - it silently falls back to "
+                    f"solving CAPTCHAs on demand, which is SLOWER than before the token pool "
+                    f"existed. Top up at capsolver.com.\n\n"
+                    f"(Repeats hourly while low.){RUNTIME_SIGNATURE}"
+                )
+        else:
+            # Recovered - reset so the next dip alerts immediately rather
+            # than waiting out an old hourly window.
+            _last_low_balance_alert_ts = 0.0
     except Exception as e:
         log_line("INFO", f"CapSolver balance check failed (non-fatal): {e}")
 
@@ -1404,25 +1474,45 @@ def _finish_booking(seat_mgr: SeatManager, date_iso: str, slot: Slot, captcha_to
             }
             previous = mark_booked(details)
             took = f"~{elapsed_since_trigger:.1f}s from slot detection to submit." if elapsed_since_trigger else ""
+            cancel = details.get("delete_url") or "(not found on the confirmation page)"
+            when = f"{date_iso} at {slot.time}"
+            speed = (
+                f"Booked {elapsed_since_trigger:.1f}s after the slot was detected."
+                if elapsed_since_trigger else "Booked."
+            )
             if previous:
-                # Round-6: an improvement, not a first booking. The old
-                # appointment is still live on the portal and only the owner
-                # can remove it - so say so unmistakably rather than burying
-                # it in a generic success message.
+                # Round-6/9: an improvement, not a first booking. The older
+                # appointment is still live and only the owner can remove it,
+                # so this has to be impossible to skim past.
                 send_telegram(
-                    f"✅ BOOKED AN EARLIER D-visa appointment at {EMBASSY_NAME}: "
-                    f"{date_iso} at {slot.time}.\n\n"
-                    f"⚠️ YOU NOW HOLD TWO APPOINTMENTS. Please delete the older one ({previous}) "
-                    f"on the portal yourself - this system cannot and will not delete it.\n\n"
-                    f"Cancel link for the NEW one (keep this, do not click it unless you want to undo): "
-                    f"{details.get('delete_url') or '(not found on the page)'}\n\n"
-                    f"Still hunting for anything earlier than {date_iso}. {took}{RUNTIME_SIGNATURE}"
+                    f"✅ BOOKED AN EARLIER APPOINTMENT\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Embassy:  Estonia, {EMBASSY_NAME}\n"
+                    f"Date:     {when}\n"
+                    f"Applicant: {applicant.get('first_name','')} {applicant.get('surname','')}\n"
+                    f"Ref:      {applicant.get('visa_application_number','-')}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{speed}\n\n"
+                    f"⚠️ ACTION NEEDED — YOU NOW HOLD TWO APPOINTMENTS.\n"
+                    f"Delete the older one ({previous}) yourself on the portal. This system "
+                    f"will never delete an appointment.\n\n"
+                    f"Cancel link for the NEW booking (keep, do not click unless undoing):\n{cancel}\n\n"
+                    f"Still hunting for anything earlier than {date_iso}.{RUNTIME_SIGNATURE}"
                 )
             else:
                 send_telegram(
-                    f"✅ BOOKED D-visa appointment for {EMBASSY_NAME}: {date_iso} at {slot.time}. {took}\n\n"
-                    f"The daemon keeps running and will automatically rebook if an EARLIER date "
-                    f"appears - you would then delete this one manually.{RUNTIME_SIGNATURE}"
+                    f"✅ APPOINTMENT BOOKED\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Embassy:  Estonia, {EMBASSY_NAME}\n"
+                    f"Date:     {when}\n"
+                    f"Applicant: {applicant.get('first_name','')} {applicant.get('surname','')}\n"
+                    f"Ref:      {applicant.get('visa_application_number','-')}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{speed}\n\n"
+                    f"Check your email for the portal's own confirmation.\n\n"
+                    f"Cancel link (keep this, do not click unless undoing):\n{cancel}\n\n"
+                    f"The daemon keeps running and will automatically rebook if an EARLIER "
+                    f"date appears — you would then delete this one manually.{RUNTIME_SIGNATURE}"
                 )
             return True
         else:
@@ -1711,6 +1801,7 @@ def poll_cycle(seat_mgr: SeatManager, elapsed_since_trigger: Optional[float]) ->
         seat_mgr.empty_poll_streak = 0
 
         log_line("SLOT_FOUND", f"date={date_iso} times={times}", elapsed_since_trigger)
+        notify_available_slots(date_iso, times, currently_booked_date())
         selected_time = choose_time(times)
         chosen_slot = next((s for s in slots if s.time == selected_time), slots[0])
         booked = attempt_booking(seat_mgr, date_iso, chosen_slot, elapsed_since_trigger)

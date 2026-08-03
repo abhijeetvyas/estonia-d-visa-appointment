@@ -236,6 +236,58 @@ def main() -> int:
         daemon.resolve_r17_refresh_dates = _real_resolve
         daemon.append_poll_csv = _real_csv
 
+    # --- Round-9: slot-availability notifications are change-driven --------
+    # SLOT_FOUND fires every 2s while a seat is parked (80+ times in the
+    # 2026-08-03 T7 run). Telegramming each one would bury the booking
+    # confirmation in noise, so notify on change only, with a floor interval.
+    _sent: list[str] = []
+    _real_tg = daemon.send_telegram
+    daemon.send_telegram = lambda msg: _sent.append(msg)
+    try:
+        daemon._last_slots_signature = ""
+        daemon._last_slots_notify_ts = 0.0
+        daemon.notify_available_slots("2026-08-18", ["10:00", "12:15"], None)
+        check(
+            "Round-9: the first slot sighting sends a Telegram listing the times",
+            len(_sent) == 1 and "10:00" in _sent[0] and "12:15" in _sent[0],
+            f"sent={_sent}",
+        )
+        check(
+            "Round-9: with nothing booked, the message says the earliest is being attempted",
+            "Nothing booked yet" in _sent[0],
+            f"sent={_sent[0][:120]}",
+        )
+
+        daemon.notify_available_slots("2026-08-18", ["10:00", "12:15"], None)
+        check(
+            "Round-9: an IDENTICAL slot list does not resend (this is what stops 2s spam)",
+            len(_sent) == 1,
+            f"sent={len(_sent)}",
+        )
+
+        # A changed list inside the floor interval is still suppressed.
+        daemon.notify_available_slots("2026-08-18", ["10:00"], None)
+        check(
+            "Round-9: a changed list within SLOTS_NOTIFY_MIN_INTERVAL_SECONDS is held back (anti-flap)",
+            len(_sent) == 1,
+            f"sent={len(_sent)}",
+        )
+
+        daemon._last_slots_notify_ts = time_module.time() - (daemon.SLOTS_NOTIFY_MIN_INTERVAL_SECONDS + 1)
+        daemon.notify_available_slots("2026-08-18", ["10:00"], "2026-08-11")
+        check(
+            "Round-9: once the interval passes, a changed list is sent",
+            len(_sent) == 2,
+            f"sent={len(_sent)}",
+        )
+        check(
+            "Round-9: when a booking is already held, the message says these are only taken if EARLIER",
+            "2026-08-11" in _sent[1] and "EARLIER" in _sent[1],
+            f"sent={_sent[1][:160]}",
+        )
+    finally:
+        daemon.send_telegram = _real_tg
+
     # --- is_booking_confirmed(): rewritten after the 2026-08-03 failure ----
     dmy = "05.08.2026"
     check(
