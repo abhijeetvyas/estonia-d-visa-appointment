@@ -700,6 +700,18 @@ def main() -> int:
         )
 
         # Discarding a STALE token on take() must ALSO trigger an immediate re-solve.
+        #
+        # Wait for the PREVIOUS re-solve to finish first. `_solve_and_store()`
+        # dedupes via `_resolve_in_progress`, so if the earlier background
+        # solve is still running, this second take() correctly does NOT call
+        # the solver again - and the assertion below would fail for a reason
+        # that has nothing to do with what it is testing. Observed exactly
+        # that on the VM (a loaded machine let the first solve outlive the
+        # second take()) while passing repeatedly on an idle one. Production
+        # behaviour is correct; the test had the race.
+        _dl = time_module.time() + 5
+        while reserve._resolve_in_progress and time_module.time() < _dl:
+            time_module.sleep(0.02)
         solve_call_log.clear()
         reserve._token = "STALE_TOKEN"
         reserve._token_ts = time_module.time() - (daemon.TOKEN_MAX_AGE_SECONDS + 10)
