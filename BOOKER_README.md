@@ -740,3 +740,39 @@ request threshold and the time threshold are kept, whichever binds first: the re
 evidence is strong but comes from one embassy on one afternoon, and a genuine time cap may also
 exist that was never isolated. Every poll now records `requests_used` in `daemon_polls.csv`, so the
 real ceiling can be measured across many runs instead of inferred from three.
+
+### Round 8 — the pre-solved token pool (why acquisition is now instant)
+
+`TokenReserve` keeps **`TOKEN_RESERVE_SIZE` (default 2)** freshly-solved CAPTCHA tokens in hand at
+all times, from daemon startup, independent of whether a seat exists.
+
+**Why it was needed.** Acquiring a seat requires a token roughly 1.5 seconds into the flow — far
+too early to prewarm reactively — so acquisition always cost a full 15–25 second solve. Measured
+repeatedly on 2026-08-03: trigger at 07:29:22, parked on the calendar at 07:29:42. Every New Delhi
+episode was therefore observed about 20 seconds late, and in all six episodes that day the slot was
+already gone.
+
+**Why two and not one.** A single warm token makes acquisition instant but strands the submit:
+acquire at t=0 consumes it, the seat is parked by t≈2s, a slot appears at t≈3s, and the submit then
+waits 15–25s for the next solve. The booking is no faster — we just watch it get taken sooner. Two
+tokens covers acquire-then-immediately-submit, which is the sequence that actually wins a slot.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `TOKEN_RESERVE_SIZE` | `2` | Below 2 the daemon logs a startup warning |
+| `TOKEN_MAX_AGE_SECONDS` | `100` | reCAPTCHA v2 tokens are valid ~120s; 100 leaves margin |
+| `TOKEN_POOL_CHECK_INTERVAL_SECONDS` | `5` | How fast a gap is noticed; a no-op when the pool is full |
+| `MAX_SOLVES_PER_HOUR` | `250` | **Raised from 60** — see below |
+
+**The rate cap had to move.** A maintained pool of 2 costs roughly 60 solves/hour by itself, which
+is exactly the old `MAX_SOLVES_PER_HOUR` default. Left at 60 the guard would have throttled the
+reserve permanently and silently — the safety mechanism would have become the bug. 250 still bounds
+a runaway loop at about $0.20/hour.
+
+**Cost.** Roughly 60 solves/hour ≈ $0.05/hour ≈ **$35/month** at CapSolver's ~$0.0008 per solve,
+running continuously. Set `TOKEN_RESERVE_SIZE=0` to disable the pool entirely and fall back to
+on-demand solving.
+
+⚠️ **Watch the balance.** At this rate a $6 balance lasts about five days. `CAPSOLVER_LOW_BALANCE_USD`
+(default $2.00) triggers a Telegram alert, but a reserve that runs dry silently reverts the daemon
+to being slower than it was before this change.

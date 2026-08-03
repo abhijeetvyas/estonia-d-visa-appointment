@@ -756,9 +756,11 @@ def main() -> int:
         daemon.cache_applicant_on_seat = real_cache_applicant
 
     # =========================================================================
-    # Round-4 Fix 12: TokenReserve.take() triggers an immediate background
-    # re-solve, instead of leaving the reserve empty for up to
-    # TOKEN_REFRESH_SECONDS (75s).
+    # Round-8: TokenReserve is now a continuously-maintained POOL, not a
+    # single token tied to seat lifetime. The pool is what makes seat
+    # acquisition instant - acquisition needs a token ~1.5s into the flow,
+    # far too early to prewarm reactively, which is why every New Delhi
+    # episode was previously observed ~20s late.
     # =========================================================================
 
     solve_call_log: list[float] = []
@@ -770,69 +772,91 @@ def main() -> int:
     daemon.solve_capsolver = fake_solve_capsolver_log
     reserve = daemon.TokenReserve()
     try:
-        reserve._token = "PRELOADED"
-        reserve._token_ts = time_module.time()
-        result = reserve.take()
         check(
-            "TokenReserve.take(): returns the currently-held fresh token (unchanged behaviour)",
-            result == "PRELOADED",
-            f"result={result}",
-        )
-        deadline = time_module.time() + 2
-        while not solve_call_log and time_module.time() < deadline:
-            time_module.sleep(0.05)
-        check(
-            "Fix 12: take()-ing a valid token kicks an immediate background re-solve, not waiting for the periodic tick",
-            len(solve_call_log) >= 1,
-            f"solve_call_log={solve_call_log}",
+            "Round-8: TOKEN_RESERVE_SIZE defaults to >=2 (one for acquisition, one for the submit ~2s later)",
+            daemon.TOKEN_RESERVE_SIZE >= 2,
+            f"TOKEN_RESERVE_SIZE={daemon.TOKEN_RESERVE_SIZE}",
         )
 
-        # Discarding a STALE token on take() must ALSO trigger an immediate re-solve.
-        #
-        # Wait for the PREVIOUS re-solve to finish first. `_solve_and_store()`
-        # dedupes via `_resolve_in_progress`, so if the earlier background
-        # solve is still running, this second take() correctly does NOT call
-        # the solver again - and the assertion below would fail for a reason
-        # that has nothing to do with what it is testing. Observed exactly
-        # that on the VM (a loaded machine let the first solve outlive the
-        # second take()) while passing repeatedly on an idle one. Production
-        # behaviour is correct; the test had the race.
+        # An empty pool tops up to the target, solving in parallel.
+        solve_call_log.clear()
+        reserve._top_up(reason="test")
         _dl = time_module.time() + 5
-        while reserve._resolve_in_progress and time_module.time() < _dl:
+        while reserve.depth() < daemon.TOKEN_RESERVE_SIZE and time_module.time() < _dl:
             time_module.sleep(0.02)
-        solve_call_log.clear()
-        reserve._token = "STALE_TOKEN"
-        reserve._token_ts = time_module.time() - (daemon.TOKEN_MAX_AGE_SECONDS + 10)
-        result2 = reserve.take()
         check(
-            "TokenReserve.take(): a token older than TOKEN_MAX_AGE_SECONDS is discarded, not returned (R29, unchanged)",
-            result2 is None,
-            f"result2={result2}",
-        )
-        deadline2 = time_module.time() + 2
-        while not solve_call_log and time_module.time() < deadline2:
-            time_module.sleep(0.05)
-        check(
-            "Fix 12: discarding a stale token on take() ALSO kicks an immediate background re-solve",
-            len(solve_call_log) >= 1,
-            f"solve_call_log={solve_call_log}",
+            "Round-8: an empty pool fills itself to TOKEN_RESERVE_SIZE",
+            reserve.depth() == daemon.TOKEN_RESERVE_SIZE,
+            f"depth={reserve.depth()} solves={len(solve_call_log)}",
         )
 
-        # take() on a GENUINELY already-empty reserve (no token to consume or
-        # discard) shouldn't spawn a redundant solve. Force it empty here
-        # rather than relying on timing, since the stale-discard case above
-        # may itself have already refilled it via its own Fix-12 re-solve by
-        # the time this line runs (that's Fix 12 working correctly, not a
-        # race to avoid).
-        with reserve._lock:
-            reserve._token = None
+        # A full pool must not keep spending money.
         solve_call_log.clear()
-        result3 = reserve.take()
+        reserve._top_up(reason="test-nop")
         time_module.sleep(0.2)
         check(
-            "TokenReserve.take(): calling take() on a genuinely-empty reserve doesn't kick a redundant solve",
-            result3 is None and len(solve_call_log) == 0,
-            f"result3={result3} solve_call_log={solve_call_log}",
+            "Round-8: a full pool triggers no further solves (the deficit calculation counts in-flight work)",
+            len(solve_call_log) == 0,
+            f"solves={len(solve_call_log)}",
+        )
+
+        # take() returns a token and refills.
+        before = reserve.depth()
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = reserve.take()
+        check(
+            "Round-8: take() returns a pre-solved token immediately - this is the 20s -> instant win",
+            isinstance(got, str) and got.startswith("TOKEN_"),
+            f"got={got!r}",
+        )
+        _dl = time_module.time() + 5
+        while reserve.depth() < before and time_module.time() < _dl:
+            time_module.sleep(0.02)
+        check(
+            "Round-8: the pool refills after a take()",
+            reserve.depth() == before,
+            f"depth={reserve.depth()} expected={before}",
+        )
+
+        # Two takes in a row must both succeed - the acquire-then-submit
+        # sequence is precisely what a pool of 1 would fail.
+        with contextlib.redirect_stdout(io.StringIO()):
+            t1 = reserve.take()
+            t2 = reserve.take()
+        check(
+            "Round-8: two consecutive takes both return tokens (acquire + submit, the sequence that wins a slot)",
+            isinstance(t1, str) and isinstance(t2, str) and t1 != t2,
+            f"t1={t1!r} t2={t2!r}",
+        )
+
+        # Expired tokens are pruned rather than handed out.
+        with reserve._lock:
+            reserve._tokens = [("ANCIENT", time_module.time() - (daemon.TOKEN_MAX_AGE_SECONDS + 10))]
+        with contextlib.redirect_stdout(io.StringIO()):
+            stale = reserve.take()
+        check(
+            "Round-8: a token older than TOKEN_MAX_AGE_SECONDS is pruned, never returned (R29)",
+            stale is None,
+            f"stale={stale!r}",
+        )
+
+        # The freshest token is handed out first, to maximise remaining validity.
+        now = time_module.time()
+        with reserve._lock:
+            reserve._tokens = [("OLDER", now - 50), ("NEWER", now - 1)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            picked = reserve.take()
+        check(
+            "Round-8: take() hands out the FRESHEST token, maximising validity for the imminent submit",
+            picked == "NEWER",
+            f"picked={picked!r}",
+        )
+
+        check(
+            "Round-8: MAX_SOLVES_PER_HOUR was raised above the pool's own steady-state cost (~60/hr), "
+            "so the safety guard cannot silently throttle the reserve",
+            daemon.MAX_SOLVES_PER_HOUR >= 120,
+            f"MAX_SOLVES_PER_HOUR={daemon.MAX_SOLVES_PER_HOUR}",
         )
     finally:
         daemon.solve_capsolver = real_solve_capsolver

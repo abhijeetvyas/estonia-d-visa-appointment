@@ -143,7 +143,23 @@ SUSPECT_AFTER_EMPTY_POLLS = int(os.environ.get("SUSPECT_AFTER_EMPTY_POLLS", "5")
 REACQUIRE_COOLDOWN_SECONDS = float(os.environ.get("REACQUIRE_COOLDOWN_SECONDS", "300"))
 TOKEN_REFRESH_SECONDS = int(os.environ.get("TOKEN_REFRESH_SECONDS", "75"))   # R27
 TOKEN_MAX_AGE_SECONDS = int(os.environ.get("TOKEN_MAX_AGE_SECONDS", "100"))  # R29
-MAX_SOLVES_PER_HOUR = int(os.environ.get("MAX_SOLVES_PER_HOUR", "60"))      # R31
+# Round 8: raised 60 -> 250. A continuously-maintained pool of 2 tokens with
+# ~120s validity costs roughly 60 solves/hour on its own, so the old cap would
+# have throttled the reserve permanently and silently - the guard would have
+# become the bug. 250 still bounds a runaway loop (~$0.20/hour) while leaving
+# the intended steady state well clear of the ceiling.
+MAX_SOLVES_PER_HOUR = int(os.environ.get("MAX_SOLVES_PER_HOUR", "250"))     # R31
+
+# Round 8: how many pre-solved tokens to keep in hand at all times. 2 is the
+# minimum that actually helps - see TokenReserve's docstring. One covers seat
+# acquisition; the second covers the submit that follows ~2s later. With only
+# one, the submit still waits 15-25s and the slot is gone.
+TOKEN_RESERVE_SIZE = int(os.environ.get("TOKEN_RESERVE_SIZE", "2"))
+
+# How often the maintenance loop checks whether the pool is short. Cheap: a
+# no-op unless a token was consumed or aged out, so this governs how quickly
+# a gap is noticed, not how often anything is spent.
+TOKEN_POOL_CHECK_INTERVAL_SECONDS = float(os.environ.get("TOKEN_POOL_CHECK_INTERVAL_SECONDS", "5"))
 CAPSOLVER_LOW_BALANCE_USD = float(os.environ.get("CAPSOLVER_LOW_BALANCE_USD", "2.00"))  # R32
 
 DAEMON_DRY_RUN = os.environ.get("DAEMON_DRY_RUN", "").lower() in ("1", "true", "yes")  # R26
@@ -694,131 +710,167 @@ def choose_time(time_labels: list[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 class TokenReserve:
-    """Keeps one freshly-solved CAPTCHA token available while a seat is live.
-    CapSolver only (R30) - see the module-level comment above for why `race`
-    is deliberately excluded here.
+    """A continuously-maintained POOL of pre-solved CAPTCHA tokens.
 
-    Round-4 Fix 11/12: this class now supports two additional, EVENT-DRIVEN
-    ways a solve can start, on top of the original periodic
-    TOKEN_REFRESH_SECONDS loop:
+    ROUND 8 (2026-08-03) - what changed and why
+    -------------------------------------------
+    Previously this held ONE token and ran only while a seat was live (R28).
+    That left the expensive path uncovered. Acquiring a seat needs a token at
+    the very first gate, ~1.5s into the flow, so it could never be prewarmed
+    in time - measured cost, repeatedly, ~20s from trigger to being parked on
+    the calendar. Every New Delhi episode was therefore observed 20 seconds
+    late, and on 2026-08-03 six consecutive episodes showed the slot already
+    gone by the time we looked.
 
-      - `prewarm()` (Fix 11): kicks a solve off immediately, in parallel
-        with whatever else is happening (specifically, the acquisition's or
-        renewal's own CAPTCHA solve) - see SeatManager.acquire()/
-        begin_overlapping_reacquire(). Previously `start()` was only called
-        AFTER a seat was fully established, so the reserve's first token
-        didn't even start solving until ~20s after the trigger - by which
-        time a booking attempt needing it was often already underway. See
-        IMPLEMENTATION_CHANGELOG.md §10 for the live timing that exposed
-        this (seat acquired 17:35:42, reserve's first token only landed
-        17:35:59).
-      - an immediate re-solve triggered from `take()` (Fix 12): previously
-        the reserve sat empty for up to TOKEN_REFRESH_SECONDS (75s) after
-        every single-use `take()`, instead of refilling right away.
+    Why the pool needs to be >= 2, not 1
+    ------------------------------------
+    A single warm token makes ACQUISITION instant but leaves the SUBMIT
+    stranded: acquire at t=0 consumes the token, the seat is parked by t=2s,
+    a slot is found at t=3s, and the submit then waits 15-25s for the next
+    solve - so the booking is no faster than before, we just watched it get
+    taken. Two tokens covers acquire-then-immediately-submit, which is
+    precisely the sequence that wins a slot. TOKEN_RESERVE_SIZE is
+    configurable; below 2 the daemon logs a warning at startup.
 
-    `_resolve_in_progress` guards against two solves running concurrently
-    (e.g. the periodic loop and an event-driven trigger firing at the same
-    moment) - solves cost real money (F3/§7), so this is a dedupe, not a
-    correctness requirement."""
+    Tokens are single-use (Google consumes them at siteverify) and valid for
+    ~120s, so the pool is refreshed continuously against TOKEN_MAX_AGE_SECONDS
+    rather than on a fixed timer per token.
+
+    CapSolver only (R30): racing providers exists to cut latency variance, and
+    nothing waits on a background pool - racing here would double the cost for
+    no benefit. `race` remains the on-demand fallback when the pool is dry.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._token: Optional[str] = None
-        self._token_ts: float = 0.0
+        self._tokens: list[tuple[str, float]] = []   # (token, solved_at), freshest last
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._resolve_in_progress = False
+        self._solves_in_flight = 0
+
+    # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
+        """Round 8: started once at daemon startup and left running for the
+        process lifetime, NOT tied to seat state. The whole point is to have
+        tokens in hand BEFORE a trigger arrives; a pool that only fills once
+        a seat exists cannot help the seat get created."""
+        if self._thread and self._thread.is_alive():
+            return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        log_line(
+            "INFO",
+            f"Token reserve started: target={TOKEN_RESERVE_SIZE} tokens, "
+            f"refreshed below {TOKEN_MAX_AGE_SECONDS:.0f}s age, CapSolver only",
+        )
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
         with self._lock:
-            self._token = None
-            self._token_ts = 0.0
-            self._resolve_in_progress = False
+            self._tokens.clear()
 
     def prewarm(self) -> None:
-        """Fix 11: kick off a solve RIGHT NOW, in the background, without
-        waiting for `start()`'s periodic loop. Safe to call even before
-        `start()` (as SeatManager.acquire() now does, concurrently with its
-        own acquisition CAPTCHA solve) and safe to call repeatedly -
-        `_solve_and_store()`'s own `_resolve_in_progress` guard means only
-        one solve actually runs at a time no matter how many callers ask."""
+        """Kept for compatibility with the round-4 call sites. With a
+        continuously-maintained pool this is normally a no-op, but it still
+        forces an immediate top-up if the pool happens to be short right when
+        a trigger lands."""
         if self._stop.is_set():
             return
-        threading.Thread(target=self._solve_and_store, kwargs={"reason": "prewarm"}, daemon=True).start()
+        threading.Thread(target=self._top_up, kwargs={"reason": "prewarm"}, daemon=True).start()
 
-    def _has_fresh_token(self) -> bool:
-        with self._lock:
-            return self._token is not None and (time.time() - self._token_ts) <= TOKEN_MAX_AGE_SECONDS
+    # -- internals ---------------------------------------------------------
 
-    def _solve_and_store(self, reason: str) -> None:
+    def _prune_locked(self) -> None:
+        """Drop tokens too old to be safely usable. Caller holds the lock."""
+        now = time.time()
+        keep = [(t, ts) for (t, ts) in self._tokens if (now - ts) <= TOKEN_MAX_AGE_SECONDS]
+        dropped = len(self._tokens) - len(keep)
+        if dropped:
+            log_line("TOKEN_STALE", f"{dropped} reserve token(s) expired unused and were discarded")
+        self._tokens = keep
+
+    def _deficit(self) -> int:
+        """How many more solves are needed to reach the target, counting
+        those already in flight so a burst of callers cannot stampede."""
         with self._lock:
-            if self._resolve_in_progress:
-                return  # a solve (periodic, prewarm, or post-take) is already in flight
-            self._resolve_in_progress = True
+            self._prune_locked()
+            return max(0, TOKEN_RESERVE_SIZE - len(self._tokens) - self._solves_in_flight)
+
+    def _solve_one(self, reason: str) -> None:
+        with self._lock:
+            self._solves_in_flight += 1
         try:
             token = solve_capsolver()
             with self._lock:
-                self._token = token
-                self._token_ts = time.time()
-            log_line("TOKEN_REFRESHED", f"reserve token refreshed (reason={reason})")
+                self._tokens.append((token, time.time()))
+                depth = len(self._tokens)
+            log_line("TOKEN_REFRESHED", f"reserve token added (reason={reason}, pool={depth}/{TOKEN_RESERVE_SIZE})")
         except RateLimitExceeded:
-            pass  # already alerted by the rate limiter itself
+            pass  # the rate limiter has already logged and alerted
         except Exception as e:
-            log_line("INFO", f"Token reserve refresh failed (reason={reason}, will retry): {e}")
+            log_line("INFO", f"Token reserve solve failed (reason={reason}, will retry): {e}")
         finally:
             with self._lock:
-                self._resolve_in_progress = False
+                self._solves_in_flight -= 1
+
+    def _top_up(self, reason: str) -> None:
+        """Solve however many tokens are missing, in parallel. Parallel
+        because a serial top-up of an empty pool would take N x 20s, and the
+        window we are trying to cover is shorter than that."""
+        need = self._deficit()
+        if need <= 0:
+            return
+        threads = [
+            threading.Thread(target=self._solve_one, kwargs={"reason": reason}, daemon=True)
+            for _ in range(need)
+        ]
+        for t in threads:
+            t.start()
 
     def _run(self) -> None:
-        first_iteration = True
         while not self._stop.is_set():
-            # Fix 11: if a prewarmed token is already sitting there fresh
-            # (started concurrently with acquisition, before this periodic
-            # loop even started), don't immediately burn a second, redundant
-            # solve on this very first pass - just start the normal
-            # TOKEN_REFRESH_SECONDS cadence from here.
-            if first_iteration and self._has_fresh_token():
-                first_iteration = False
-                self._stop.wait(TOKEN_REFRESH_SECONDS)
-                continue
-            first_iteration = False
-            self._solve_and_store(reason="periodic")
-            # Wait TOKEN_REFRESH_SECONDS, but wake immediately on stop().
-            self._stop.wait(TOKEN_REFRESH_SECONDS)
+            try:
+                self._top_up(reason="maintain")
+            except Exception as e:
+                log_line("INFO", f"Token reserve maintenance error (continuing): {e}")
+            # Poll frequently but cheaply: _top_up() is a no-op unless the
+            # pool is actually short, so this costs nothing when full. The
+            # short interval is what lets a token expiring or being consumed
+            # be replaced promptly rather than on a slow fixed tick.
+            self._stop.wait(TOKEN_POOL_CHECK_INTERVAL_SECONDS)
+
+    # -- public ------------------------------------------------------------
 
     def take(self) -> Optional[str]:
-        """Returns a still-fresh token and clears it (single-use), or None if
-        empty/stale (R29). Caller (booking path, R23) must solve on demand
-        if this returns None. Fix 12: either way (a valid token consumed, or
-        a stale one discarded), the reserve is now empty - kick an immediate
-        background re-solve instead of waiting for the next periodic
-        TOKEN_REFRESH_SECONDS tick (up to 75s away). The periodic loop in
-        `_run()` keeps running as the steady-state mechanism regardless;
-        this is an additional, faster-recovery trigger, not a replacement."""
+        """Pop the FRESHEST usable token, or None if the pool is dry.
+
+        Freshest rather than oldest deliberately: the caller is about to use
+        it immediately, so maximising remaining validity matters more than
+        avoiding waste, and an older token left behind may still serve a
+        subsequent take a second later.
+        """
         with self._lock:
-            had_token = self._token is not None
-            if self._token is None:
+            self._prune_locked()
+            if not self._tokens:
+                depth = 0
                 result = None
             else:
-                age = time.time() - self._token_ts
-                if age > TOKEN_MAX_AGE_SECONDS:
-                    log_line("TOKEN_STALE", f"reserve token discarded, age={age:.0f}s > {TOKEN_MAX_AGE_SECONDS}s")
-                    self._token = None
-                    result = None
-                else:
-                    result = self._token
-                    self._token = None
-        if had_token:
-            threading.Thread(target=self._solve_and_store, kwargs={"reason": "post-take"}, daemon=True).start()
+                token, _ts = self._tokens.pop()   # freshest is last
+                depth = len(self._tokens)
+                result = token
+        if result is not None:
+            log_line("INFO", f"Took a pre-solved token from the reserve (pool now {depth}/{TOKEN_RESERVE_SIZE})")
+        threading.Thread(target=self._top_up, kwargs={"reason": "post-take"}, daemon=True).start()
         return result
+
+    def depth(self) -> int:
+        with self._lock:
+            self._prune_locked()
+            return len(self._tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +951,14 @@ class SeatManager:
                 log_line("INFO", f"D-visa not currently offered (F8) - cannot acquire a seat. Services: {services}")
                 return False
 
-            captcha_token = solve_on_demand()
+            # Round 8: this is THE line the pool exists for. Acquisition needs
+            # a token ~1.5s into the flow, far too early to prewarm
+            # reactively, so before the pool this always cost a full 15-25s
+            # solve and every episode was seen ~20s late.
+            captcha_token = self.token_reserve.take()
+            if captcha_token is None:
+                log_line("INFO", "Token reserve dry at acquisition - solving on demand (~15-25s)")
+                captcha_token = solve_on_demand()
             applicant = load_applicant_data()
             seat = establish_seat(EMBASSY_ID, applicant, captcha_token, session=session)
             cache_applicant_on_seat(seat, applicant)
@@ -914,7 +973,6 @@ class SeatManager:
             self.last_forced_refresh_ts = time.time()  # Fix 8: the establish_seat() call above IS the first refresh
             self.dates_at_acquisition = list(seat.available_dates)
             self.empty_poll_streak = 0  # Fix 7: fresh seat, fresh evidence window
-            self.token_reserve.start()
             log_line(
                 "SEAT_ACQUIRED",
                 f"dates_seen={seat.available_dates} age=0s requests_used={seat.requests_used}",
@@ -1021,7 +1079,10 @@ class SeatManager:
                         f"R12: D-visa no longer offered - skipping {reason} reacquire, keeping current seat. Services: {services}",
                     )
                     return
-                captcha_token = solve_on_demand()
+                captcha_token = self.token_reserve.take()
+                if captcha_token is None:
+                    log_line("INFO", f"Token reserve dry at {reason} reacquire - solving on demand (~15-25s)")
+                    captcha_token = solve_on_demand()
                 applicant = load_applicant_data()
                 new_seat = establish_seat(EMBASSY_ID, applicant, captcha_token, session=session)
                 cache_applicant_on_seat(new_seat, applicant)
@@ -1110,7 +1171,6 @@ class SeatManager:
 
     def drop_seat(self) -> None:
         self.seat = None
-        self.token_reserve.stop()
         # Reset scheduling state too, so a subsequent acquire() (which also
         # resets these itself) can't be confused by stale timers if anything
         # ever reads them in the gap between drop and re-acquire.
@@ -1736,6 +1796,19 @@ def main() -> int:
 
     seat_mgr = SeatManager()
     trigger_watcher = TriggerWatcher()
+
+    # Round 8: start filling the token pool immediately, before any trigger.
+    # This is the whole point of the change - a pool that only fills once a
+    # seat exists cannot help the seat get created, and seat acquisition is
+    # exactly where the 20-second CAPTCHA cost was being paid.
+    if TOKEN_RESERVE_SIZE < 2:
+        log_line(
+            "INFO",
+            f"WARNING: TOKEN_RESERVE_SIZE={TOKEN_RESERVE_SIZE}. With fewer than 2 tokens, "
+            f"acquisition consumes the only one and the submit ~2s later still waits "
+            f"15-25s for a fresh solve - which is the exact failure this pool exists to remove.",
+        )
+    seat_mgr.token_reserve.start()
 
     trigger_ts: Optional[float] = None  # latest trigger seen (Fix 7's freshness checks use seat_mgr.last_trigger_ts, same value)
     episode_start_ts: Optional[float] = None  # Fix 15: first trigger of the CURRENT episode - see update_episode_start()
