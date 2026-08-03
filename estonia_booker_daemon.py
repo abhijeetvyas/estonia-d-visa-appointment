@@ -154,7 +154,21 @@ REACQUIRE_COOLDOWN_SECONDS = float(os.environ.get("REACQUIRE_COOLDOWN_SECONDS", 
 # worse, not better: the token would be closer to expiry when replacement
 # began.
 TOKEN_REFRESH_SECONDS = int(os.environ.get("TOKEN_REFRESH_SECONDS", "75"))   # R27
-TOKEN_MAX_AGE_SECONDS = int(os.environ.get("TOKEN_MAX_AGE_SECONDS", "100"))  # R29
+# Round 12: raised 100 -> 110. This is the age at which a token stops being
+# handed out at all, NOT the age at which a replacement starts (that is
+# TOKEN_REFRESH_SECONDS=75). Raising it therefore costs nothing - the
+# replacement cadence, and so the solve rate, is unchanged - and widens the
+# overlap covering a slow solve from 25s to 35s.
+#
+# The narrower expiry margin (10s against ~120s validity, instead of 20s) only
+# ever applies to a token that is being used as a LAST RESORT: with proactive
+# replacement running, anything older than 100s is only reached if the pool
+# has nothing fresher, i.e. solves are failing or a burst consumed everything.
+# In that situation the alternative is not a safer token, it is no token at
+# all - and if the old one has expired the submit simply fails and the poll
+# loop retries 2s later with a fresh one. A maybe-valid token strictly beats
+# nothing when the fallback is recoverable.
+TOKEN_MAX_AGE_SECONDS = int(os.environ.get("TOKEN_MAX_AGE_SECONDS", "110"))  # R29
 # Round 8: raised 60 -> 250. A continuously-maintained pool of 2 tokens with
 # ~120s validity costs roughly 60 solves/hour on its own, so the old cap would
 # have throttled the reserve permanently and silently - the guard would have

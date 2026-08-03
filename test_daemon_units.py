@@ -936,10 +936,16 @@ def main() -> int:
             f"refresh={daemon.TOKEN_REFRESH_SECONDS} max_age={daemon.TOKEN_MAX_AGE_SECONDS}",
         )
         check(
-            "Round-11: the gap between them exceeds a worst-case 25s solve, so the new token "
+            "Round-11/12: the gap between them exceeds a worst-case 25s solve, so the new token "
             "lands before the old one expires",
             (daemon.TOKEN_MAX_AGE_SECONDS - daemon.TOKEN_REFRESH_SECONDS) >= 25,
             f"gap={daemon.TOKEN_MAX_AGE_SECONDS - daemon.TOKEN_REFRESH_SECONDS}s",
+        )
+        check(
+            "Round-12: a token is still discarded well inside reCAPTCHA's ~120s validity, "
+            "leaving margin for the 1-2s between take() and use",
+            daemon.TOKEN_MAX_AGE_SECONDS <= 112,
+            f"max_age={daemon.TOKEN_MAX_AGE_SECONDS}",
         )
 
         _now = time_module.time()
