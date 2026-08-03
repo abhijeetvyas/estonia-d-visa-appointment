@@ -163,6 +163,79 @@ def main() -> int:
     finally:
         daemon.load_booked_state = real_load
 
+    # --- Round-7: idle date-refresh backoff --------------------------------
+    # A seat has a ~100-request budget. Between episodes the calendar is
+    # empty, and refreshing it every 10s burns that budget in ~17 minutes -
+    # so the seat is usually dead by the time the next episode starts, and we
+    # pay the 20s CAPTCHA acquisition all over again. Backing off to 60s while
+    # idle stretches the same budget to ~100 minutes.
+    _refresh_calls: list[str] = []
+    _real_resolve = daemon.resolve_r17_refresh_dates
+    _real_csv = daemon.append_poll_csv
+    daemon.resolve_r17_refresh_dates = lambda seat: (_refresh_calls.append("x") or seat.available_dates)
+    daemon.append_poll_csv = lambda *a, **kw: None
+    try:
+        def _mk(dates):
+            m = daemon.SeatManager()
+            m.seat = http_flow.Seat(
+                session=http_flow.new_session(), embassy_id="40", token="t",
+                established_at=time_module.time(),
+                available_dates=list(dates), last_seen_dates=list(dates),
+            )
+            return m
+
+        # Empty calendar, 30s since last refresh: under the 60s idle interval
+        # but over the 10s active one - must NOT refresh.
+        m = _mk([])
+        m.last_date_refresh_ts = time_module.time() - 30
+        _refresh_calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            daemon.maybe_refresh_dates(m, forced=False, elapsed_since_trigger=None)
+        check(
+            "Round-7: empty calendar + 30s elapsed -> NO refresh (idle interval is 60s, not 10s)",
+            _refresh_calls == [],
+            f"refresh_calls={_refresh_calls}",
+        )
+
+        m.last_date_refresh_ts = time_module.time() - (daemon.IDLE_DATE_REFRESH_INTERVAL_SECONDS + 1)
+        _refresh_calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            daemon.maybe_refresh_dates(m, forced=False, elapsed_since_trigger=None)
+        check(
+            "Round-7: empty calendar + idle interval elapsed -> refresh happens",
+            len(_refresh_calls) == 1,
+            f"refresh_calls={_refresh_calls}",
+        )
+
+        # Dates present: the fast 10s cadence must still apply.
+        m2 = _mk([iso(5)])
+        m2.last_date_refresh_ts = time_module.time() - 30
+        _refresh_calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            daemon.maybe_refresh_dates(m2, forced=False, elapsed_since_trigger=None)
+        check(
+            "Round-7: dates present + 30s elapsed -> refresh happens (active cadence unchanged at 10s)",
+            len(_refresh_calls) == 1,
+            f"refresh_calls={_refresh_calls}",
+        )
+
+        # A trigger must cut through the idle backoff - this is what makes the
+        # parked seat responsive the instant an episode starts.
+        m3 = _mk([])
+        m3.last_date_refresh_ts = time_module.time()      # just refreshed
+        m3.last_forced_refresh_ts = 0.0                   # no recent forced refresh
+        _refresh_calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            daemon.maybe_refresh_dates(m3, forced=True, elapsed_since_trigger=1.0)
+        check(
+            "Round-7: a trigger forces a refresh even while idle-backed-off (episode responsiveness preserved)",
+            len(_refresh_calls) == 1,
+            f"refresh_calls={_refresh_calls}",
+        )
+    finally:
+        daemon.resolve_r17_refresh_dates = _real_resolve
+        daemon.append_poll_csv = _real_csv
+
     # --- is_booking_confirmed(): rewritten after the 2026-08-03 failure ----
     dmy = "05.08.2026"
     check(

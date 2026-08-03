@@ -99,6 +99,25 @@ SLOT_POLL_INTERVAL_SECONDS = float(os.environ.get("SLOT_POLL_INTERVAL_SECONDS", 
 # This is gated independently of SLOT_POLL_INTERVAL_SECONDS so the two
 # cadences can be tuned separately; see maybe_refresh_dates().
 DATE_REFRESH_INTERVAL_SECONDS = float(os.environ.get("DATE_REFRESH_INTERVAL_SECONDS", "10"))
+
+# Round-7: when the calendar shows NO dates at all - i.e. between availability
+# episodes, which is most of the time - refreshing every 10s is pure waste,
+# and expensive waste: a seat has a hard budget of ~95-100 requests (F5
+# corrected), so a 10s idle cadence burns it in ~17 minutes.
+#
+# That matters far more than it sounds. A seat cannot be ACQUIRED unless
+# D-visa is currently offered (F8), but an existing one survives perfectly
+# well after an episode ends - observed 2026-08-03 at seat_age=452s with an
+# empty date list. So a seat that outlives the gap between episodes is
+# already parked when the next one starts, and sees the slot ~1s after the
+# trigger instead of ~20s after it (the CAPTCHA-bound acquisition). Episodes
+# came 5-40 minutes apart that day; at 60s idle the same budget lasts ~100
+# minutes, which covers nearly all of those gaps.
+#
+# Responsiveness is not sacrificed: a trigger forces an immediate refresh
+# (subject only to FORCED_REFRESH_MIN_INTERVAL_SECONDS), so the moment the
+# monitor sees D-visa, the parked seat re-reads the calendar within ~1s.
+IDLE_DATE_REFRESH_INTERVAL_SECONDS = float(os.environ.get("IDLE_DATE_REFRESH_INTERVAL_SECONDS", "60"))
 # Round-3 follow-up Fix 8: a forced date-list refresh (triggered by a new
 # trigger-file update while a seat is already live) runs at most this often,
 # no matter how many trigger updates arrive - the monitor re-announcing the
@@ -1406,7 +1425,13 @@ def maybe_refresh_dates(seat_mgr: SeatManager, forced: bool, elapsed_since_trigg
         if (now - seat_mgr.last_forced_refresh_ts) < FORCED_REFRESH_MIN_INTERVAL_SECONDS:
             return False  # debounced - the monitor is just re-announcing the same episode
     else:
-        if (now - seat_mgr.last_date_refresh_ts) < DATE_REFRESH_INTERVAL_SECONDS:
+        # Round-7: back right off while the calendar is empty, to preserve the
+        # seat's ~100-request budget for the episode that matters.
+        interval = (
+            IDLE_DATE_REFRESH_INTERVAL_SECONDS if not seat.available_dates
+            else DATE_REFRESH_INTERVAL_SECONDS
+        )
+        if (now - seat_mgr.last_date_refresh_ts) < interval:
             return False  # not due yet - reuse the cached date list, no request made
 
     q0 = time.time()
