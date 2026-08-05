@@ -1,0 +1,31 @@
+# Local/OS noise
+.DS_Store
+__pycache__/
+*.pyc
+
+# Secrets - never commit (see AI_CONTEXT.md / BOOKER_README.md)
+run_monitor.sh
+run_booker_daemon_env.sh
+applicant_data_real.json
+applicant_data_real_2.json
+combined_ca_bundle.pem
+yr2_intermediate.der
+yr2_intermediate.pem
+
+# Python virtualenv
+venv/
+
+# Runtime state - regenerated on the VM, per-embassy/per-applicant
+.state/
+
+# Monitor logs
+monitor.log
+monitor.log.*
+alerts_history.log
+
+# Booker/daemon logs and artifacts (default + BOOKING_PROFILE-suffixed)
+booker.log
+booker_screenshots/
+daemon*.log
+daemon_polls*.csv
+daemon_dumps*/

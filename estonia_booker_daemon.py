@@ -76,6 +76,22 @@ from estonia_booking_http import (
 EMBASSY_ID = os.environ.get("EMBASSY_ID", "40")
 EMBASSY_NAME = os.environ.get("EMBASSY_NAME", "New Delhi")
 
+# Round 13 (owner's request, 2026-08-05): run a second, fully independent
+# hunt for a different applicant against the same embassy. Without this, a
+# second daemon instance for the same EMBASSY_ID would share
+# BOOKED_STATE_FILE/DAEMON_LOCK_FILE with the first applicant's instance -
+# the lock would refuse to let it start, and should_book_date() would treat
+# applicant 1's held appointment as something applicant 2 must "beat" to
+# book at all. Setting BOOKING_PROFILE namespaces the state file, lock file,
+# log, poll CSV and dump directory by this label, so a second instance is a
+# genuinely separate booking hunt: it starts from "nothing booked yet" and
+# takes the earliest date it can get, same as applicant 1's instance did
+# originally. TRIGGER_FILE is deliberately NOT namespaced - both instances
+# must react to the same monitor detection for this embassy. Leave unset for
+# the original single-applicant behaviour (identical filenames to before).
+BOOKING_PROFILE = os.environ.get("BOOKING_PROFILE", "").strip()
+_PROFILE_SUFFIX = f"_{BOOKING_PROFILE}" if BOOKING_PROFILE else ""
+
 SEAT_TTL_SECONDS = int(os.environ.get("SEAT_TTL_SECONDS", "1440"))          # R10: measured ceiling (F5)
 SEAT_RENEW_AFTER_SECONDS = int(os.environ.get("SEAT_RENEW_AFTER_SECONDS", "1200"))  # R10: operating number
 
@@ -214,17 +230,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STATE_DIR = SCRIPT_DIR / ".state"
 TRIGGER_FILE = STATE_DIR / f"trigger_{EMBASSY_ID}.json"
 # Deliberately the SAME booked-flag file used by the old Playwright booker
-# (estonia_d_visa_booker.py's STATE_FILE convention) - R25 requires never
-# booking twice, and that guarantee only holds if both bookers that could
-# ever run against this embassy (old Playwright fallback, new daemon) check
-# and set the same flag rather than maintaining independent, unsynced ideas
-# of whether a booking already exists.
-BOOKED_STATE_FILE = STATE_DIR / f"booker_state_{EMBASSY_ID}.json"
-DAEMON_LOCK_FILE = Path(f"/tmp/estonia_booker_daemon_{EMBASSY_ID}.lock")  # R41
+# (estonia_d_visa_booker.py's STATE_FILE convention) when BOOKING_PROFILE is
+# unset - R25 requires never booking twice, and that guarantee only holds if
+# both bookers that could ever run against this embassy (old Playwright
+# fallback, new daemon) check and set the same flag rather than maintaining
+# independent, unsynced ideas of whether a booking already exists. Note the
+# old Playwright booker does NOT understand BOOKING_PROFILE - it always reads
+# the unsuffixed file, so it only ever sees/protects applicant 1's booking.
+BOOKED_STATE_FILE = STATE_DIR / f"booker_state_{EMBASSY_ID}{_PROFILE_SUFFIX}.json"
+DAEMON_LOCK_FILE = Path(f"/tmp/estonia_booker_daemon_{EMBASSY_ID}{_PROFILE_SUFFIX}.lock")  # R41
 
-DAEMON_LOG_FILE = SCRIPT_DIR / "daemon.log"          # R33
-POLLS_CSV_FILE = SCRIPT_DIR / "daemon_polls.csv"     # R35
-DUMPS_DIR = SCRIPT_DIR / "daemon_dumps"              # R36
+DAEMON_LOG_FILE = SCRIPT_DIR / f"daemon{_PROFILE_SUFFIX}.log"          # R33
+POLLS_CSV_FILE = SCRIPT_DIR / f"daemon_polls{_PROFILE_SUFFIX}.csv"     # R35
+DUMPS_DIR = SCRIPT_DIR / f"daemon_dumps{_PROFILE_SUFFIX}"              # R36
 
 DUMMY_DATA_PATH = Path(os.environ.get("APPLICANT_DATA_DUMMY", SCRIPT_DIR / "applicant_data_dummy.json"))
 REAL_DATA_PATH = Path(os.environ.get("APPLICANT_DATA_REAL", SCRIPT_DIR / "applicant_data_real.json"))
@@ -319,6 +337,8 @@ def _telegram_creds() -> tuple[str, list[str]]:
 
 
 def send_telegram(message: str) -> None:
+    if BOOKING_PROFILE:
+        message = f"[{BOOKING_PROFILE}] {message}"
     try:
         token, chat_ids = _telegram_creds()
     except Exception as e:
@@ -1927,8 +1947,9 @@ def main() -> int:
 
     log_line(
         "INFO",
-        f"Daemon starting. embassy={EMBASSY_ID}/{EMBASSY_NAME} dry_run={DAEMON_DRY_RUN} "
-        f"self_detect={DAEMON_SELF_DETECT} captcha_provider={CAPTCHA_PROVIDER}",
+        f"Daemon starting. embassy={EMBASSY_ID}/{EMBASSY_NAME} profile={BOOKING_PROFILE or '(default)'} "
+        f"dry_run={DAEMON_DRY_RUN} self_detect={DAEMON_SELF_DETECT} captcha_provider={CAPTCHA_PROVIDER} "
+        f"state_file={BOOKED_STATE_FILE.name} applicant_data={REAL_DATA_PATH.name}",
     )
     send_telegram(
         f"🚀 Estonia D-visa booker daemon started for {EMBASSY_NAME}"

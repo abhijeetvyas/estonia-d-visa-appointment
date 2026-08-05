@@ -4,9 +4,13 @@
 # live in a non-root-owned home directory).
 #
 # Install with: sudo cp estonia-booker-daemon.logrotate /etc/logrotate.d/estonia-booker-daemon
+#
+# Glob patterns (not just daemon.log/daemon_polls.csv) so a second,
+# BOOKING_PROFILE-suffixed instance's daemon_<profile>.log /
+# daemon_polls_<profile>.csv get rotated too, without a second stanza.
 
-/home/abhijeetvyas13/estonia-d-visa-appointment/daemon.log
-/home/abhijeetvyas13/estonia-d-visa-appointment/daemon_polls.csv {
+/home/abhijeetvyas13/estonia-d-visa-appointment/daemon*.log
+/home/abhijeetvyas13/estonia-d-visa-appointment/daemon_polls*.csv {
     daily
     rotate 7
     compress
