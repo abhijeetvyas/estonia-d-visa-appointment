@@ -6,6 +6,7 @@ __pycache__/
 # Secrets - never commit (see AI_CONTEXT.md / BOOKER_README.md)
 run_monitor.sh
 run_booker_daemon_env.sh
+run_booker_dryrun.sh
 applicant_data_real.json
 applicant_data_real_2.json
 combined_ca_bundle.pem
