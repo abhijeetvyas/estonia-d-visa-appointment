@@ -663,6 +663,68 @@ sudo logrotate -f /etc/logrotate.d/estonia-booker-daemon   # force a test rotati
 rm -f .state/booker_state_<EMBASSY_ID>.json
 ```
 
+### Round 13 — switching the daemon between applicants (`BOOKING_PROFILE`)
+
+The owner's actual need (2026-08-05): applicant 1 already has the earliest
+possible appointment, so the daemon will never book them anything better -
+`should_book_date()` (see below) only ever takes a STRICTLY EARLIER date than
+what's already held. Rather than run a second daemon process in parallel
+(considered and explicitly rejected - it would double the standing CAPTCHA-
+token-pool cost, ~$35/month → ~$70/month, and double request volume against
+the site, for no benefit when only one applicant's hunt is ever actually
+active at a time), the single daemon process is repointed at a different
+applicant and restarted. Only one daemon ever runs.
+
+`BOOKING_PROFILE` (env var, default unset) namespaces `BOOKED_STATE_FILE`,
+`DAEMON_LOCK_FILE`, `DAEMON_LOG_FILE`, `POLLS_CSV_FILE` and `DUMPS_DIR` by a
+label - e.g. `BOOKING_PROFILE=applicant2` reads/writes
+`.state/booker_state_<EMBASSY_ID>_applicant2.json` instead of
+`.state/booker_state_<EMBASSY_ID>.json`, logs to `daemon_applicant2.log`
+instead of `daemon.log`, etc. Combined with pointing `APPLICANT_DATA_REAL` at
+a different file, the daemon starts from "nothing booked yet" for whichever
+profile is active and hunts/books using that profile's applicant details -
+completely independent of what any other profile has recorded, without
+touching that other profile's state file. `TRIGGER_FILE` is NOT namespaced -
+whichever profile is active still reacts to the same monitor detection for
+this embassy (there's only one D-visa queue to watch, regardless of who ends
+up booking into it).
+
+**Use `switch_daemon_applicant.sh`, don't edit `run_booker_daemon_env.sh` by
+hand.** It rewrites only a clearly-marked block in that file (every other
+line - Telegram/CapSolver/Twilio secrets - is left alone) and restarts the
+one daemon service:
+
+```bash
+cd ~/estonia-d-visa-appointment
+
+# One-time: give applicant 2's real details (never committed to git)
+cp applicant_data_real_2.json.example applicant_data_real_2.json
+nano applicant_data_real_2.json
+chmod 600 applicant_data_real_2.json
+
+# Switch the (single) daemon to hunt/book for applicant 2:
+./switch_daemon_applicant.sh applicant2
+
+# Switch back to applicant 1 later:
+./switch_daemon_applicant.sh applicant1
+```
+
+**`--clear-state` — only after the real appointment is actually cancelled on
+the site.** Switching profiles alone never deletes anything; a profile you
+switch away from and back to still remembers what it booked. Use this flag
+only once you've cancelled that profile's held appointment for real, so the
+daemon is told the truth and resumes hunting for anything, not just
+something earlier than an appointment you no longer hold:
+
+```bash
+./switch_daemon_applicant.sh applicant1 --clear-state
+```
+
+This deletes `.state/booker_state_<EMBASSY_ID>[_<profile>].json` for the
+target profile, then restarts. Never run it for a profile whose appointment
+is still genuinely booked - the daemon has no way to independently confirm
+cancellation, it only trusts what this file says.
+
 ## Creating / pushing the `gcp-booker` branch (from your laptop or the VM)
 
 ```bash

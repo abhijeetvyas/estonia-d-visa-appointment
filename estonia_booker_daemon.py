@@ -76,19 +76,22 @@ from estonia_booking_http import (
 EMBASSY_ID = os.environ.get("EMBASSY_ID", "40")
 EMBASSY_NAME = os.environ.get("EMBASSY_NAME", "New Delhi")
 
-# Round 13 (owner's request, 2026-08-05): run a second, fully independent
-# hunt for a different applicant against the same embassy. Without this, a
-# second daemon instance for the same EMBASSY_ID would share
-# BOOKED_STATE_FILE/DAEMON_LOCK_FILE with the first applicant's instance -
-# the lock would refuse to let it start, and should_book_date() would treat
-# applicant 1's held appointment as something applicant 2 must "beat" to
-# book at all. Setting BOOKING_PROFILE namespaces the state file, lock file,
-# log, poll CSV and dump directory by this label, so a second instance is a
-# genuinely separate booking hunt: it starts from "nothing booked yet" and
-# takes the earliest date it can get, same as applicant 1's instance did
-# originally. TRIGGER_FILE is deliberately NOT namespaced - both instances
-# must react to the same monitor detection for this embassy. Leave unset for
-# the original single-applicant behaviour (identical filenames to before).
+# Round 13 (owner's request, 2026-08-05): let the SAME single daemon process
+# be switched between applicants, instead of running one instance per
+# applicant in parallel (rejected - doubles the standing CAPTCHA-token-pool
+# cost and request volume for no benefit, since only one applicant's hunt is
+# ever actually active at a time; see BOOKER_README.md's "Round 13" section
+# and switch_daemon_applicant.sh). Without this, should_book_date() would
+# treat applicant 1's already-held appointment as something applicant 2 must
+# "beat" to book at all - there would be no way to point the daemon at a
+# second applicant and have it start from "nothing booked yet". Setting
+# BOOKING_PROFILE namespaces the state file, lock file, log, poll CSV and
+# dump directory by this label, so switching profiles switches which
+# applicant's booking record the daemon reads/writes, without touching the
+# other profile's record. TRIGGER_FILE is deliberately NOT namespaced -
+# whichever profile is active still reacts to the same monitor detection for
+# this embassy. Leave unset for the original single-applicant behaviour
+# (identical filenames to before this existed).
 BOOKING_PROFILE = os.environ.get("BOOKING_PROFILE", "").strip()
 _PROFILE_SUFFIX = f"_{BOOKING_PROFILE}" if BOOKING_PROFILE else ""
 
