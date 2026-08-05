@@ -1528,6 +1528,17 @@ def _finish_booking(seat_mgr: SeatManager, date_iso: str, slot: Slot, captcha_to
             log_line("BOOKING_FAILED", "seat died during submit", elapsed_since_trigger)
             seat_mgr.drop_seat()
             return False
+        except requests.exceptions.HTTPError as e:
+            # 2026-08-05: a 4xx from the submit (e.g. 422) used to be logged
+            # as just the exception string, with the response body - the one
+            # thing that would actually say WHICH field the site rejected -
+            # silently discarded because raise_for_status() throws before
+            # submit_booking() ever reads r.text. Capture it here instead,
+            # same as every other booking-failure path already does (R36).
+            body = e.response.text if e.response is not None else ""
+            dump_path = dump_html(f"booking_http_error_{EMBASSY_ID}", body) if body else "(no response body captured)"
+            log_line("BOOKING_FAILED", f"submit request failed: {e} - dump: {dump_path}", elapsed_since_trigger)
+            return False
         except Exception as e:
             log_line("BOOKING_FAILED", f"submit request failed: {e}", elapsed_since_trigger)
             return False
