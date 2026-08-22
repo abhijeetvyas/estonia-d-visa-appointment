@@ -522,7 +522,7 @@ Empty output - confirmed no diff. This file was not opened for editing at any po
 ALL TESTS PASSED
 ```
 
-(32 checks total, 32 passed. One failure on first write, fixed before this final run: the `drop_seat()` test asserted `empty_poll_streak == 0` but `drop_seat()` hadn't actually been updated to reset it yet - added `self.last_forced_refresh_ts = 0.0` and `self.empty_poll_streak = 0` to `drop_seat()`, with a comment noting `last_reacquire_ts` is deliberately NOT reset there since it's a daemon-wide cooldown, not a per-seat one. Re-ran and all 32 passed. Recorded here per this codebase's established practice of showing real, including initially-wrong, results rather than only the clean final run.)
+(32 checks total, 32 passed. One failure on first write, fixed before this final run: the `drop_seat()` test asserted `empty_poll_streak == 0` but `drop_seat()` hadn't actually been updated to reset it yet - added `self.last_forced_refresh_ts = 0.0` and `self.empty_poll_streak = 0` to `drop_seat()`, with a comment noting `last_reacquire_ts` is deliberately NOT reset there since it's a daemon-wide cooldown, not a per-seat one. Re-ran and all 32 passed. Recorded here per this codebase's established practice of showing real, including initially-wrong, results.)
 
 **Smoke test (confirms the daemon still starts/shuts down cleanly with the new logic present):**
 ```
@@ -957,3 +957,21 @@ booking landed.
   remains the single largest gap and is the reason today's events were handled by the old booker.
 - **No `SEAT_DIED` dump has been captured** (round 5's Fix 18 instrumentation).
 - **R17 is still unverified** — whether the step-4 replay genuinely refreshes the date list.
+
+
+## Post-Round-6 addendum
+
+This changelog's Round 6 entry (2026-08-03) was its last synced update, even
+though development continued well past that point — see BOOKER_README.md's
+"Round 13" section (2026-08-05) for the multi-applicant / systemd-deployment
+work that followed. Rounds 7-12 were never separately logged here.
+
+Round 6 noted that the HTTP daemon "has never run in live mode... no systemd
+unit installed," with real bookings up to that point credited to the old
+Playwright booker. That has since changed: the HTTP daemon
+(estonia_booker_daemon.py + estonia_booking_http.py) went live and
+successfully booked a real appointment, confirmed by this daemon.log line:
+
+    2026-08-05T05:33:37+00:00 [BOOKING_SUCCESS] Booked {'date': '2026-08-06',
+    'time': '10:45', 'slot_id': '2246795', 'embassy': '40'} (first booking).
+    Still hunting for an earlier date.
