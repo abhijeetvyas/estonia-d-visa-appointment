@@ -1,9 +1,0 @@
-{
-  "first_name": "APPLICANT_2_FIRST_NAME",
-  "surname": "APPLICANT_2_SURNAME",
-  "date_of_birth": "DD.MM.YYYY",
-  "phone": "+91XXXXXXXXXX",
-  "email": "applicant2.email@example.com",
-  "visa_application_number": "APPLICANT_2_PREFILLED_VISA_APP_NUMBER",
-  "specifying_information": "visa appointment for myself"
-}
