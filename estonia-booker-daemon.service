@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=abhijeetvyas13
 WorkingDirectory=/home/abhijeetvyas13/estonia-d-visa-appointment
-# R39 requires "the same env vars as run_monitor.sh". run_monitor.sh itself
+# The daemon needs the same env vars as run_monitor.sh. run_monitor.sh itself
 # is not reusable as-is here: it ends by synchronously invoking the monitor
 # script, and it is not in git (holds all secrets as `export` lines - see
 # AI_CONTEXT.md §3), so this repo cannot ship a copy of it. Instead, extract
@@ -22,14 +22,14 @@ WorkingDirectory=/home/abhijeetvyas13/estonia-d-visa-appointment
 ExecStart=/bin/bash -lc 'source /home/abhijeetvyas13/estonia-d-visa-appointment/run_booker_daemon_env.sh && exec /home/abhijeetvyas13/estonia-d-visa-appointment/venv/bin/python3 /home/abhijeetvyas13/estonia-d-visa-appointment/estonia_booker_daemon.py'
 Restart=always
 RestartSec=10
-# R40: SIGTERM is handled explicitly in estonia_booker_daemon.py (finishes
+# SIGTERM is handled explicitly in estonia_booker_daemon.py (finishes
 # any in-flight booking attempt, logs shutdown, exits 0) - give it real time
-# to do that instead of systemd's default 90s-then-SIGKILL being fine anyway,
-# but also not so long that a genuinely hung process blocks a restart.
+# to do that instead of systemd's default 90s-then-SIGKILL, but also not so
+# long that a genuinely hung process blocks a restart.
 TimeoutStopSec=30
 KillSignal=SIGTERM
 
-# stdout/stderr also go to journald as a second copy of daemon.log (R33) -
+# stdout/stderr also go to journald as a second copy of the daemon's own log -
 # useful for `journalctl -u estonia-booker-daemon -f` without tailing the
 # file directly.
 StandardOutput=journal
