@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-T1 (spec §9): unit tests for the daemon's pure-logic pieces - date/time
-preference rules including the R22 multi-date fallback, plus
+Unit tests for the daemon's pure-logic pieces - date/time
+preference rules including the multi-date fallback, plus
 `estonia_booking_http`'s seat-death detection and CSRF-token extraction.
 
 Round-2 follow-up additions: unit tests for the global rate limiter (Fix 3,
@@ -12,12 +12,11 @@ and `SeatManager.acquire()` monkeypatched so no real HTTP/CAPTCHA calls are
 made).
 
 These all run with no network access and no live credentials, which is why
-they are the one item in the spec's test plan (T1-T9) that could be executed
-directly in the implementation sandbox - see IMPLEMENTATION_CHANGELOG.md §5/§8
-for why T2-T9 could not be run here (no egress to broneering.mfa.ee, no
-CAPSOLVER_API_KEY/Telegram credentials available in this session) and must be
-run for real against Abu Dhabi/Cairo/Astana before trusting this in
-production.
+they were the part of the original test plan that could be executed
+directly in the implementation sandbox - other planned tests need real HTTP
+access (no egress to broneering.mfa.ee, no CAPSOLVER_API_KEY/Telegram
+credentials available in that session) and must be run for real against
+Abu Dhabi/Cairo/Astana before trusting this in production.
 
 Usage:
     venv/bin/python3 test_daemon_units.py
@@ -85,8 +84,8 @@ class FakeClock:
 
 def main() -> int:
     # --- rank_dates(): round-6 - EARLIEST first, today and past excluded ---
-    # Replaced R20's "latest date >=3 days out". Earlier is now strictly
-    # better because the daemon rebooks whenever an earlier date appears.
+    # Replaced the original "latest date >=3 days out" rule. Earlier is now
+    # strictly better because the daemon rebooks whenever an earlier date appears.
     dates = [iso(1), iso(4), iso(10), iso(2)]
     ranked = daemon.rank_dates(dates)
     check(
@@ -323,7 +322,7 @@ def main() -> int:
         http_flow.is_booking_confirmed("<p>Choose the representation</p>", dmy) is False,
     )
 
-    # --- choose_time(): R21 preference for 12:00-14:00 ---
+    # --- choose_time(): preference for 12:00-14:00 ---
     check(
         "choose_time: prefers earliest slot in 12:00-14:00",
         daemon.choose_time(["09:00", "13:15", "12:00", "18:00"]) == "12:00",
@@ -351,7 +350,7 @@ def main() -> int:
         "extract_token: returns None when absent",
         http_flow.extract_token("<html><body>no token here</body></html>") is None,
     )
-    # Turbo-stream-wrapped variant (see spec §5's note on this)
+    # Turbo-stream-wrapped variant
     turbo_html = (
         '<turbo-stream action="update" target="x"><template>'
         '<input name="broneering[_token]" value="xyz789">'
@@ -362,7 +361,7 @@ def main() -> int:
         http_flow.extract_token(turbo_html) == "xyz789",
     )
 
-    # --- estonia_booking_http.is_seat_dead(): R13's positive death signature ---
+    # --- estonia_booking_http.is_seat_dead(): positive death signature ---
     alive_html = (
         '<html><body>'
         '<input name="broneering[_token]" value="tok1">'
@@ -527,9 +526,9 @@ def main() -> int:
 
         # --- Fix 8 (round 3): forced refresh is debounced - identical or not
         # -   -no-longer-suspect logic lives in maybe_refresh_dates() at all.
-        # Round 2's "forced + identical dates -> suspect -> reacquire" tests
-        # tested behaviour that round 3 deliberately removed (see
-        # IMPLEMENTATION_CHANGELOG.md §9) - replaced below with debounce tests.
+        # An earlier version's "forced + identical dates -> suspect ->
+        # reacquire" tests tested behaviour that was later deliberately
+        # removed - replaced below with debounce tests.
         seat_mgr.seat = make_seat([iso(5)])
         seat_mgr.last_forced_refresh_ts = time_module.time()  # "just force-refreshed"
         refresh_calls.clear()
@@ -671,7 +670,7 @@ def main() -> int:
     )
 
     # --- SeatManager.begin_overlapping_reacquire itself: reuses the SAME
-    # renewal machinery/lock for both reasons (R14 concurrency cap shared) ---
+    # renewal machinery/lock for both reasons (only one allowed in flight) ---
     sm7 = fresh_seat_mgr([iso(5)])
     with sm7._renewal_lock:
         sm7._renewal_in_progress = True  # simulate a renewal already in flight
@@ -997,7 +996,7 @@ def main() -> int:
     # =========================================================================
     # Round-4 Fix 13: an on-demand solve at booking time must never block the
     # main loop / poll cadence, and a booking attempt must remain
-    # single-flight (no concurrent submits on the same session, R16).
+    # single-flight (no concurrent submits on the same session).
     # =========================================================================
 
     solve_started = threading.Event()
