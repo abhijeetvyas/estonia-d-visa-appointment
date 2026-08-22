@@ -8,15 +8,17 @@ before making any changes.
 
 Repo: `https://github.com/abhijeetvyas/estonia-d-visa-appointment`
 Human owner: Abhijeet Vyas.
-Live branch: **`gcp-setup`** was the original detection-only branch. **`gcp-booker`** is where
-all subsequent development happened — it adds a Playwright-driven auto-booker on top of the
-original monitor (see section 8 for its full reasoning trail). As of this writing, `gcp-booker`
-has been extensively validated via `DRY_RUN=1` dry-runs on the VM but confirm with the human
-whether `run_monitor.sh` has actually been pointed at `estonia_visa_monitor_booker_hook.py`
-(live) versus still calling `estonia_visa_monitor.py` directly (detection-only) before assuming
-which mode is currently live in production.
+Live branch: **`gcp-daemon`** is the current branch to work from — see `BOOKER_README.md`'s
+Parked-Session Booker Daemon section. `gcp-setup` was the original detection-only branch, and
+`gcp-booker` came next — it added a Playwright-driven auto-booker on top of the original monitor
+(see section 8 for its full reasoning trail) — before development continued on to `gcp-daemon`.
+As of the `gcp-booker` era described in sections 9-10 below, `gcp-booker` had been extensively
+validated via `DRY_RUN=1` dry-runs on the VM but confirm with the human whether `run_monitor.sh`
+has actually been pointed at `estonia_visa_monitor_booker_hook.py` (live) versus still calling
+`estonia_visa_monitor.py` directly (detection-only) before assuming which mode is currently live
+in production.
 `main` is stale — it only contains the original GitHub-Actions-only version of this project
-and should NOT be assumed to reflect current behavior. Always work from `gcp-booker` unless
+and should NOT be assumed to reflect current behavior. Always work from `gcp-daemon` unless
 told otherwise, and confirm the current default/production branch with the human before
 assuming `main` is authoritative.
 
@@ -428,7 +430,7 @@ machine that has this repo synced — it has NOT been pushed to `origin/gcp-book
 been pulled onto the GCP VM.** See "Deploy status" at the end of this section before assuming
 either the fix or the VM's current running code is in any particular state.
 
-### 9.1 Bugs found in commits `615bbb0`, `ff476e7`, `d108749` (all by `digvijayv`, all on `gcp-booker` only — `main` and `gcp-setup` never had these commits, confirmed via `git merge-base --is-ancestor`, so those two branches needed no fix)
+### 9.1 Bugs found in commits `615bbb0`, `ff476e7`, `d108749` (all by a contributor, all on `gcp-booker` only — `main` and `gcp-setup` never had these commits, confirmed via `git merge-base --is-ancestor`, so those two branches needed no fix)
 
 These three commits (adding `lxml`, switching the monitor to session-reuse + `lxml` parsing +
 a retry loop, and adding pip caching to the GitHub Actions workflow) were well-intentioned but
