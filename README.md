@@ -1,85 +1,60 @@
-# Estonia D-Visa Slot Monitor
+# Estonia D-Visa Slot Monitor & Booker
 
-Checks Estonia's consular booking site (`broneering.mfa.ee`) on a tight schedule and alerts
-you the moment the "Long-stay visa (D-visa) application" service becomes bookable for a given
-embassy. No LLM/agent runs at check time — this is a plain, deterministic script, so the cost
-per check is effectively zero regardless of how often it runs.
+Estonia's visa appointment site rarely has open slots, and when one does open, it's usually
+gone within a minute or two. This project watches the site around the clock and, the moment a
+slot opens, either alerts you immediately or — if you turn on the optional add-on — books it
+for you automatically, faster than a human could click through the form.
 
-Alerts go out over two channels: Telegram (every single check where a slot is found, uncapped,
-to multiple recipients) and an actual phone call via Twilio (throttled, since a ringing phone
-survives silent mode/Do Not Disturb in a way a push notification doesn't).
+It runs on a small cloud server (not your own laptop), so it keeps working even when your
+computer is off.
 
-**Looking for the automated booker add-on** (Playwright-driven auto-booking once a slot is
-detected, CAPTCHA solving, date/time selection, etc.)? That's a separate layer on top of this
-monitor — see `BOOKER_README.md`.
+## The two pieces
 
----
+- **The Monitor** — checks the booking site every 10 seconds. The instant the visa service
+  becomes available, it sends you a Telegram message and calls your phone (a call is much
+  harder to miss than a notification). This is the base setup and is free to run.
+- **The Booker** (optional) — once a slot is detected, this tries to complete the booking
+  for you automatically, in about 1 second. It needs a small amount of setup (your real
+  applicant details, and a paid CAPTCHA-solving service, a few cents per attempt) because the
+  actual booking step requires solving a "I'm not a robot" challenge.
 
-## Architecture, and why each piece was chosen
+You can run just the Monitor, or the Monitor plus the Booker. Either way, the Monitor never
+stops alerting you, even if the Booker isn't set up or crashes — so you can always fall back
+to booking it yourself by hand.
 
-**Why not an agent (e.g. Gumloop) running this on a schedule?**
-The task itself never requires judgment at runtime — fetch a page, look for one specific
-string, alert if found. An agent re-reasoning about that every single scheduled run burns
-tokens for no benefit, since the logic doesn't change between runs. The right place for an
-LLM here is at build time (writing/debugging the script), not at execution time.
-
-**Why not rely on GitHub Actions' built-in `schedule` trigger?**
-It's kept in this repo (`.github/workflows/estonia-visa-monitor.yml`) as a documented,
-disabled-by-default alternative — see "Running just the GitHub Actions monitor (no VM
-needed)" below — but it is not the primary way this runs. GitHub's own cron scheduler is
-explicitly "best effort," and for anything more frequent than about an hour on a low-traffic
-personal repo, it can drift badly — schedules that should fire every 15 minutes were observed
-firing as infrequently as every 1–1.5 hours. That's not acceptable for a monitor whose whole
-value is speed.
-
-**Why a self-hosted VM instead of any cloud scheduler (GitHub Actions, cron-job.org, etc.)?**
-Two separate problems pushed this direction:
-1. Scheduling reliability — a VM's own OS-level `cron` fires exactly on time, with no
-   dependency on a third party's shared scheduler queue.
-2. Network-layer issues — requests from shared/rotating cloud IP ranges (like GitHub Actions
-   runners) intermittently failed with connection timeouts and SSL errors against this
-   specific site. Running from a single, dedicated VM removes that variable.
-
-**Why Google Cloud's `e2-micro` over Oracle Cloud's Always Free tier?**
-Oracle's free tier is more generous on paper (more CPU/RAM), but it explicitly reclaims
-"idle" Always Free instances — defined as 95th-percentile CPU utilization under 20% over a
-7-day period. A cron job that wakes up for a couple of seconds every 30 seconds and is
-otherwise idle the rest of the time is exactly the profile Oracle's policy targets for
-reclamation. GCP's `e2-micro` Always Free tier has no equivalent idle-reclamation policy,
-making it more predictable for a workload that's supposed to sit idle almost all the time.
-
-**Why does the script use `requests`/`BeautifulSoup` instead of a real browser (Playwright etc.)?**
-The site doesn't currently require JavaScript execution or solve a CAPTCHA at this specific
-step, so a lightweight HTTP client is sufficient and far cheaper to run. If the site adds a
-CAPTCHA/JS challenge later, this approach would need to move to a headless browser instead.
-
-**Why Telegram *and* a phone call, instead of just one channel?**
-Telegram is free and instant but easy to miss if a slot opens and closes within minutes. A
-phone call is much harder to miss, and — critically — travels over the cellular voice network
-rather than the internet, so it can still reach you if WiFi/data happens to be off. Telegram
-stays uncapped as the "log of record"; the phone call is throttled since three unanswered
-calls in a row means calling a fourth time immediately isn't help, it's noise.
+**Want the full story of how and why this was built this way** — including approaches that
+were tried and abandoned along the way? See `Article - Building a Zero-Agent Visa Monitor with
+AI v2.md`. For a deeper technical/engineering log, see `AI_CONTEXT.md`.
 
 ---
 
-## One-time setup
+## What you'll need
 
-### 1. Create the GCP VM
+- A Google Cloud account (there's a permanently free tier that comfortably runs the Monitor;
+  the Booker is heavier and works best on a small paid tier, roughly $10-25/month)
+- A Telegram account (for alerts — free)
+- A Twilio account (optional, for phone-call alerts — a few cents per call)
+- Only if you want the Booker: a CapSolver account (for solving the CAPTCHA automatically,
+  roughly $0.001 per solve) and your real visa application details
 
-- console.cloud.google.com → Compute Engine → VM instances → Create Instance.
-- **Region**: one of the Always Free eligible regions — `us-west1`, `us-central1`, or
-  `us-east1`.
-- **Machine type**: `e2-micro` (this specific shape is the free-tier-eligible one).
-- **Boot disk**: any recent Debian/Ubuntu, **Standard persistent disk** (not "Balanced" —
-  that's billed), 30GB or less.
-- **Provisioning model**: Standard (not Spot — Spot instances aren't Always Free eligible).
-- Leave inbound firewall rules off — this script only makes outbound requests, no inbound
-  access is needed at all.
-- The GCP console's "Monthly estimate" panel will show a non-zero cost during setup — this is
-  expected and not a mistake. It shows list price before the Always Free credit is applied;
-  the credit is applied later, on your actual invoice.
+---
 
-### 2. SSH in and install dependencies
+## Setup
+
+### 1. Create the server
+
+- Go to console.cloud.google.com → Compute Engine → VM instances → Create Instance.
+- **Region**: `us-west1`, `us-central1`, or `us-east1` (these are eligible for the free tier).
+- **Machine type**: `e2-micro` if you only want the Monitor (free). If you also want the
+  Booker, use `e2-standard-2` instead — it's heavier and this incurs real (small) billing;
+  see "Turning on the Booker" below for how to resize this later if you start on the free tier.
+- **Boot disk**: any recent Debian/Ubuntu, standard persistent disk, 30GB or less.
+- **Provisioning model**: Standard (not Spot).
+- You can leave inbound network access off — this only makes outbound requests.
+
+### 2. Install the monitor
+
+SSH into the new server (the GCP console has a "SSH" button right next to your VM), then:
 
 ```bash
 sudo apt update && sudo apt install -y python3-pip python3-venv git
@@ -90,15 +65,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-If cloning a private repo fails with `Password authentication is not supported`, you need a
-GitHub Personal Access Token (fine-grained, scoped to this repo, with **Contents: Read-only**
-permission) to use as the password when prompted.
+### 3. A one-time site quirk to work around
 
-### 3. Fix the SSL certificate chain issue
-
-This site's server doesn't send its full TLS certificate chain — browsers silently patch this
-via automatic intermediate-certificate fetching, but Python's `requests` library doesn't. Fetch
-the missing intermediate once and bundle it in:
+The visa site's server has a small TLS configuration issue that trips up Python (but not
+regular web browsers). Run this once to fix it:
 
 ```bash
 curl -s http://yr2.i.lencr.org/ -o yr2_intermediate.der
@@ -106,32 +76,32 @@ openssl x509 -inform DER -in yr2_intermediate.der -out yr2_intermediate.pem
 cat "$(venv/bin/python3 -c 'import certifi; print(certifi.where())')" yr2_intermediate.pem > combined_ca_bundle.pem
 ```
 
-(If this ever breaks again months from now, it's likely because Let's Encrypt rotated their
-intermediate — re-run `openssl s_client -connect broneering.mfa.ee:443 -servername broneering.mfa.ee -showcerts`
-to find the current "CA Issuers" URL and repeat the steps above.)
+(If this ever stops working months from now, it's likely because the site's certificate
+provider rotated something — re-run
+`openssl s_client -connect broneering.mfa.ee:443 -servername broneering.mfa.ee -showcerts`
+to find the current URL and repeat the steps above.)
 
-### 4. Set up Telegram
+### 4. Set up Telegram alerts
 
-- Message [@BotFather](https://t.me/BotFather), run `/newbot`, save the token it gives you.
-- Have every intended recipient message the bot at least once (Telegram blocks bots from
-  messaging users who haven't initiated contact first).
-- Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser to find each recipient's
-  `chat.id`.
+- Message [@BotFather](https://t.me/BotFather) on Telegram, send `/newbot`, and save the
+  token it gives you.
+- Message your new bot once (anything), then visit
+  `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser to find your `chat.id`.
 
-### 5. Set up Twilio (for the phone call escalation)
+### 5. Set up phone-call alerts (optional but recommended)
 
-- Buy a Twilio phone number with Voice capability (Console → Phone Numbers).
-- If on a trial account, verify every destination number under Verified Caller IDs (trial
-  accounts can only call verified numbers).
-- Console → Develop → TwiML Bins → Create new bin, with content:
+- Buy a Twilio phone number with Voice capability.
+- If your Twilio account is on a trial plan, verify the number(s) you want it to call under
+  "Verified Caller IDs" (trial accounts can only call verified numbers).
+- Create a "TwiML Bin" in the Twilio console with this content:
   ```xml
   <Response>
     <Say loop="3">Estonia visa slot is now available. Check Telegram and book immediately.</Say>
   </Response>
   ```
-- Copy the bin's Request URL — this is `TWILIO_TWIML_URL` below.
+- Copy that bin's URL — you'll need it below.
 
-### 6. Create the wrapper script with all secrets
+### 6. Save your secrets
 
 ```bash
 cat > run_monitor.sh << 'EOF'
@@ -150,32 +120,33 @@ EOF
 chmod +x run_monitor.sh
 ```
 
-Calling the venv's `python3` by its full path directly (rather than `source venv/bin/activate`
-first) is deliberate — under cron, `source`-based activation was found to intermittently not
-take effect, causing `ModuleNotFoundError` on some runs.
+Replace `YOUR_USERNAME` and the placeholder values with your own. Leave the Twilio lines out
+entirely if you're skipping phone-call alerts.
 
-### 7. Set up cron for 10-second checks
+### 7. Turn the monitor on
 
-Cron's minimum native granularity is one minute, so six offset lines are used — each firing
-once a minute but staggered by 0/10/20/30/40/50 seconds via `sleep` — giving an effective
-10-second cadence. All six share the same lock file so overlapping runs skip cleanly instead
-of stacking up (expect a higher `SKIPPED` count than at looser intervals, since there's less
-slack before the next tick).
+This checks the site every 10 seconds. (A single scheduled task can only fire once a minute at
+minimum, so six are used, staggered 10 seconds apart, to add up to a 10-second cadence.)
 
 ```bash
 cat > /tmp/current_cron << 'EOF'
-* * * * * /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
-* * * * * sleep 10; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
-* * * * * sleep 20; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
-* * * * * sleep 30; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
-* * * * * sleep 40; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
-* * * * * sleep 50; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh || echo "$(date -Iseconds) SKIPPED: previous run still in progress" >> /home/YOUR_USERNAME/estonia-d-visa-appointment/monitor.log
+* * * * * /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh
+* * * * * sleep 10; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh
+* * * * * sleep 20; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh
+* * * * * sleep 30; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh
+* * * * * sleep 40; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh
+* * * * * sleep 50; /usr/bin/flock -n /tmp/estonia_visa_monitor.lock /home/YOUR_USERNAME/estonia-d-visa-appointment/run_monitor.sh
 EOF
 crontab /tmp/current_cron
-crontab -l   # verify it took
+crontab -l   # confirm it took
 ```
 
+Test it worked with `TEST_TELEGRAM=true ./run_monitor.sh` — you should get a Telegram message
+(and a test call, if you set up Twilio) within a few seconds.
+
 ### 8. Set up log rotation
+
+So the log file doesn't grow forever:
 
 ```bash
 sudo tee /etc/logrotate.d/estonia-visa-monitor > /dev/null << 'EOF'
@@ -190,155 +161,178 @@ sudo tee /etc/logrotate.d/estonia-visa-monitor > /dev/null << 'EOF'
     su YOUR_USERNAME YOUR_USERNAME
 }
 EOF
-sudo logrotate -f /etc/logrotate.d/estonia-visa-monitor   # test it rotates cleanly
 ```
+
+**You're done with the base setup.** From here you'll get an alert the moment a slot opens.
+Continue below only if you also want it booked automatically.
 
 ---
 
-## Command reference
+## Turning on the Booker (optional)
 
-Run all of these from `~/estonia-d-visa-appointment` on the VM.
+The Booker uses a paid CAPTCHA-solving service to get past the site's human-verification step,
+then submits the booking form itself — typically within about a second of a slot appearing.
 
-### Running / testing
+### 1. Give it your real details
 
 ```bash
-./run_monitor.sh                       # one real check against the live site
-TEST_TELEGRAM=true ./run_monitor.sh    # sends a test Telegram message + test call to all recipients,
-                                        # bypassing the call cooldown, without touching the real site
+cp applicant_data_real.json.example applicant_data_real.json
+nano applicant_data_real.json    # fill in your real name, date of birth, phone, email, and
+                                  # your visa application number (from your original application)
+chmod 600 applicant_data_real.json
 ```
 
-### Viewing logs
+This file is never uploaded anywhere except directly to the visa site's own form, and it's
+excluded from git so it can't accidentally end up in this repository.
+
+### 2. Get a CAPTCHA-solving API key
+
+Sign up at [capsolver.com](https://www.capsolver.com) and top up a small balance (a few
+dollars lasts a long time at typical usage — CapSolver bills per solve, at a small fraction of
+a cent each).
+
+### 3. If you started on the free-tier server, resize it
+
+The Booker is heavier than the Monitor (it may briefly use more CPU while working). If your VM
+is still `e2-micro`, stop it and resize:
 
 ```bash
-tail -f monitor.log                    # watch live
-tail -20 monitor.log                   # last 20 lines
-cat alerts_history.log                 # permanent record of every real AVAILABLE/FAILURE event —
-                                        # never manually clear this file
-ls -la monitor.log*                    # see what's been rotated (monitor.log.1, monitor.log.2.gz, ...)
-zcat monitor.log.2.gz                  # view a compressed rotated file
+# Console → Compute Engine → your instance → Stop, then:
+gcloud compute instances set-machine-type estonia-visa-monitor \
+  --zone=us-central1-<your-zone> \
+  --machine-type=e2-standard-2
+# then Start it again
 ```
 
-### Combined report across all logs (current + rotated + compressed)
+This takes it out of the free tier, so it starts incurring a small ongoing cost — check
+current GCP pricing before committing. Everything else on the VM is untouched.
+
+### 4. Add the Booker's secrets
 
 ```bash
-ALL_LOGS=$( { cat monitor.log monitor.log.1 2>/dev/null; zcat monitor.log.*.gz 2>/dev/null; } )
-echo "Total runs: $(echo "$ALL_LOGS" | grep -cE "NOT available|AVAILABLE:|MONITOR FAILURE")"
-echo "Available: $(echo "$ALL_LOGS" | grep -c 'AVAILABLE:')"
-echo "Not available: $(echo "$ALL_LOGS" | grep -c 'NOT available')"
-echo "Failures: $(echo "$ALL_LOGS" | grep -c 'MONITOR FAILURE')"
-echo "Skipped (overlap): $(echo "$ALL_LOGS" | grep -c 'SKIPPED')"
-```
-
-### Verifying cron is actually firing (independent of what the script logs)
-
-```bash
-grep -c CRON /var/log/syslog           # total times cron has invoked anything, ever (per this log file)
-grep CRON /var/log/syslog | tail -20   # most recent invocations
-```
-
-### Cron / crontab management
-
-```bash
-crontab -l                             # view current schedule
-```
-To edit, always build the file via heredoc rather than pasting into the interactive `crontab -e`
-editor — browser-based SSH terminals frequently mangle multi-line pastes into `nano`:
-```bash
-cat > /tmp/current_cron << 'EOF'
-<paste desired crontab lines here>
+cat >> run_monitor.sh << 'EOF'
+export CAPSOLVER_API_KEY="your_capsolver_key"
+export APPLICANT_DATA_REAL="/home/YOUR_USERNAME/estonia-d-visa-appointment/applicant_data_real.json"
+export APPLICANT_DATA_DUMMY="/home/YOUR_USERNAME/estonia-d-visa-appointment/applicant_data_dummy.json"
 EOF
-crontab /tmp/current_cron
 ```
 
-### Logrotate
+Then extract just these secret lines into a second file the Booker reads from directly:
 
 ```bash
-sudo logrotate -d /etc/logrotate.d/estonia-visa-monitor   # dry run
-sudo logrotate -f /etc/logrotate.d/estonia-visa-monitor   # force a rotation now
+grep '^export ' run_monitor.sh > run_booker_daemon_env.sh
 ```
 
-### Editing secrets/config
-
-```bash
-nano run_monitor.sh                    # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TWILIO_* vars
-```
-
-### Pulling code updates
+### 5. Install and start the Booker
 
 ```bash
-git status                              # see any local diffs
-git pull                                # fetch latest from the tracked branch
+source venv/bin/activate
+pip install -r requirements.txt   # installs playwright too, used only by an older fallback booker
+sudo cp estonia-booker-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now estonia-booker-daemon
+sudo systemctl status estonia-booker-daemon   # confirm it's running
 ```
 
-### Fixing a stale git lock (`index.lock` / `HEAD.lock`)
+Set up log rotation for it too, same idea as the Monitor's:
 
-If `git commit`/`git push`/etc. fail with something like:
-```
-fatal: Unable to create '.../.git/index.lock': File exists.
-Another git process seems to be running in this repository...
-```
-this is a leftover lock file from a previous git process that didn't clean up after itself
-(not an actual concurrent process still running - if you're not mid-`git commit` in another
-terminal/editor right now, it's safe to remove). Fix:
 ```bash
-rm -f .git/index.lock    # or .git/HEAD.lock, whichever the error names
-git status               # confirm it's back to normal before retrying
+sudo cp estonia-booker-daemon.logrotate /etc/logrotate.d/estonia-booker-daemon
 ```
-Then retry the original `git add`/`commit`/`push` command.
+
+From now on, the Booker runs continuously in the background, and restarts itself
+automatically if it ever crashes.
+
+### 6. Test it without risking a real booking
+
+```bash
+export DAEMON_DRY_RUN=1
+venv/bin/python3 estonia_booker_daemon.py
+```
+
+This runs through the entire flow — solving a real CAPTCHA, reaching the booking screen —
+but stops one step short of actually submitting, using the placeholder "John Doe" details in
+`applicant_data_dummy.json` rather than your real ones.
+
+### 7. If you're booking for two people
+
+If you (or a family member) each need your own appointment, one Booker can hunt for both —
+just point it at a different applicant's details and restart:
+
+```bash
+cp applicant_data_real_2.json.example applicant_data_real_2.json
+nano applicant_data_real_2.json
+chmod 600 applicant_data_real_2.json
+
+./switch_daemon_applicant.sh applicant2   # switches the Booker to hunt/book for person 2
+./switch_daemon_applicant.sh applicant1   # switches back to person 1
+```
+
+Only one hunt is ever active at a time — this doesn't run two Bookers in parallel, it just
+repoints the same one. Once someone's real appointment is later cancelled and you want the
+Booker to start hunting fresh for them again, add `--clear-state`:
+`./switch_daemon_applicant.sh applicant1 --clear-state` (only do this once the real
+appointment is actually cancelled — otherwise the Booker won't know to stop treating it as
+already secured).
 
 ---
 
-## Alerting behavior summary
+## Everyday commands
+
+Run these from `~/estonia-d-visa-appointment` on the server.
+
+```bash
+./run_monitor.sh                        # run one check manually
+TEST_TELEGRAM=true ./run_monitor.sh     # send a test alert without touching the real site
+tail -f monitor.log                     # watch the Monitor's live log
+sudo systemctl status estonia-booker-daemon      # is the Booker running?
+journalctl -u estonia-booker-daemon -f           # watch the Booker's live log
+cat alerts_history.log                  # permanent record of every real alert ever sent
+crontab -l                              # see the Monitor's schedule
+git pull                                # get the latest version of this code
+```
+
+---
+
+## What alerts look like
 
 | Event | Telegram | Phone call |
 |---|---|---|
-| Slot found | Every check, uncapped, all recipients | Up to 3 calls, 5 min apart, then 6h cooldown before a fresh cycle |
-| Not found | Nothing (silent) | Nothing |
-| Script failure | One alert, then 1.5h cooldown before repeating | Never — failures are frequent/expected during outages and shouldn't ring anyone |
-| Test run (`TEST_TELEGRAM=true`) | Always sent | Always placed, ignores cooldown |
+| Slot found | Every check, instantly | Up to 3 calls, then a cooldown before trying again |
+| Slot found, and the Booker secured it | A ✅ success message | — |
+| Slot found, but the Booker couldn't secure it | A message telling you to book by hand, fast | — |
+| Nothing found | Silent | — |
+| Something's broken | One alert, then it won't repeat for a while | Never — this isn't urgent enough to call about |
 
 ---
 
-## Running just the GitHub Actions monitor (no VM needed)
+## Prefer not to run a server? Use GitHub Actions instead
 
 This repo also ships a plain GitHub Actions workflow
-(`.github/workflows/estonia-visa-monitor.yml`) that runs
-`estonia_visa_monitor.py` on GitHub's own infrastructure — no VM, no
-daemon, no auto-booking. Good enough if you just want a Telegram ping when
-a slot opens and are fine handling the booking yourself.
+(`.github/workflows/estonia-visa-monitor.yml`) that runs the Monitor on GitHub's own
+infrastructure — no server to set up or pay for, but no Booker, and it checks only every 15
+minutes instead of every 10 seconds (a real trade-off if slots close within minutes).
 
-**It's disabled by default** (the `schedule:` trigger is commented out in
-the workflow file) so it won't run automatically the moment you clone/fork
-this repo. To turn it on:
+**It's off by default.** To turn it on:
 
-1. Add two repo secrets: Settings → Secrets and variables → Actions → New
-   repository secret:
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-2. (Optional) To target an embassy other than New Delhi, add `EMBASSY_ID` /
-   `EMBASSY_NAME` as repo variables or edit the `env:` block in the
-   workflow file — the script is already parameterized for this.
-3. Open `.github/workflows/estonia-visa-monitor.yml` and uncomment the
-   `schedule:` block (instructions are inline in the file) to enable the
-   every-15-minutes cron. Or leave it commented out and just trigger runs
-   manually from the Actions tab → "Estonia D-Visa Slot Monitor" → **Run
-   workflow** whenever you want an on-demand check.
-
-This is the lighter-weight sibling of the full VM+daemon setup described
-above — see `BOOKER_README.md` if you also want automatic booking once a
-slot is detected, not just an alert.
+1. In this repository's Settings → Secrets and variables → Actions, add two secrets:
+   `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+2. Open `.github/workflows/estonia-visa-monitor.yml` and uncomment the schedule lines
+   (instructions are right there in the file).
+3. Or leave it off and just trigger a check manually anytime from this repo's **Actions** tab.
 
 ---
 
-## Known limitations
+## Current limitations
 
-- If the site adds a CAPTCHA or JavaScript challenge to this step, this `requests`-based
-  approach would stop working and need to move to a headless browser (e.g. Playwright).
-- The CSRF token is fetched fresh every single run — this can't be cached, since Estonia's
-  booking form requires a valid session token per submission.
-- `run_monitor.sh` and the CA bundle/intermediate cert files are intentionally not tracked in
-  git (they contain secrets or are generated locally) — if this VM is ever rebuilt, steps 3 and
-  6 above need to be redone by hand.
-- To reuse this for a different embassy, set `EMBASSY_ID` and `EMBASSY_NAME` as additional
-  environment variables in `run_monitor.sh` rather than forking the repo — the script is
-  already parameterized for this.
+- The visa site requires solving a "I'm not a robot" CAPTCHA at the actual booking step. The
+  Booker handles this automatically via a paid solving service, but it does mean each real
+  booking attempt costs a small fee (a fraction of a cent) rather than being entirely free.
+- You need your own real applicant details entered in advance for the Booker to use — it
+  can't book anything for you it doesn't already have your information for.
+- Running the Booker costs a small monthly server fee, since it needs more than the
+  permanently-free server tier.
+- This has been tested against the New Delhi embassy and a couple of others, but the site
+  could change its design at any time, which may require updating the code.
+- To monitor a different embassy, set `EMBASSY_ID` and `EMBASSY_NAME` in `run_monitor.sh` —
+  the code already supports this, no need to modify anything else.
