@@ -1,4 +1,4 @@
-# Estonia D-Visa Booker (gcp-booker branch)
+# Estonia D-Visa Booker (main branch)
 
 This branch adds automatic booking on top of the existing high-frequency monitor.
 The original `estonia_visa_monitor.py` is **untouched**.
@@ -46,7 +46,7 @@ The original `estonia_visa_monitor.py` is **untouched**.
 ```bash
 cd ~/estonia-d-visa-appointment
 git fetch origin
-git checkout gcp-booker          # or create the branch – see bottom of this file
+git checkout main                # or create the branch – see bottom of this file
 
 # install Playwright + browser
 source venv/bin/activate
