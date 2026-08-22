@@ -8,7 +8,7 @@ before making any changes.
 
 Repo: `https://github.com/abhijeetvyas/estonia-d-visa-appointment`
 Human owner: Abhijeet Vyas.
-Live branch: **`gcp-daemon`** is the current branch to work from — see `BOOKER_README.md`'s
+Live branch: **`main`** (renamed from `gcp-daemon` on 2026-08-22 — see the update note below) is the current branch to work from — see `BOOKER_README.md`'s
 Parked-Session Booker Daemon section. `gcp-setup` was the original detection-only branch, and
 `gcp-booker` came next — it added a Playwright-driven auto-booker on top of the original monitor
 (see section 8 for its full reasoning trail) — before development continued on to `gcp-daemon`.
@@ -17,10 +17,11 @@ validated via `DRY_RUN=1` dry-runs on the VM but confirm with the human whether 
 has actually been pointed at `estonia_visa_monitor_booker_hook.py` (live) versus still calling
 `estonia_visa_monitor.py` directly (detection-only) before assuming which mode is currently live
 in production.
-`main` is stale — it only contains the original GitHub-Actions-only version of this project
-and should NOT be assumed to reflect current behavior. Always work from `gcp-daemon` unless
-told otherwise, and confirm the current default/production branch with the human before
-assuming `main` is authoritative.
+**2026-08-22 update: this repo now has a single branch.** The branch described throughout
+this file as `gcp-daemon` was renamed to `main`, and the separate `only-monitor` branch (the
+GitHub-Actions-only version this paragraph used to warn about) was deleted once `gcp-daemon`'s
+content fully superseded it. Any reference below to "the `gcp-daemon` branch" now means `main`;
+there is no other branch to check against.
 
 ---
 
@@ -418,7 +419,7 @@ if this behavior is ever revisited, that trade-off was made knowingly, not misse
 `RUNTIME_LABEL` (section 5) exists specifically so alerts are distinguishable by source machine
 when running this way.
 
-## 9. Aug 2026 session: digvijayv regression fix + real production log analysis (read this before touching monitor.py, the workflow YAML, or trying to speed up detection frequency)
+## 9. Aug 2026 session: contributor regression fix + real production log analysis (read this before touching monitor.py, the workflow YAML, or trying to speed up detection frequency)
 
 This section documents a single analysis/debugging session by an AI agent (Claude, via Cowork)
 on 2026-08-02, covering three things a future agent (including a fresh Claude/Opus/Fable session
@@ -524,7 +525,7 @@ render, nothing was left:
 
 Every single one of these is longer — some 2-3x longer — than the ~30-second real-world race
 window documented in section 2.14 (how fast another applicant took a slot after it first appeared,
-observed once). **These 5 events predate `gcp-booker`'s tip moving to the digvijayv commits** (they
+observed once). **These 5 events predate `gcp-booker`'s tip moving to the contributor's commits** (they
 ran under whichever code was live on the VM before `d108749`/`ff476e7`/`615bbb0` existed), so they
 are not evidence of the bugs in 9.1 causing this — they reflect the booker's inherent speed against
 this specific race, independent of that regression.
@@ -593,7 +594,7 @@ race window, which at a current best case of 36s is not yet consistently achieve
   syncing this folder. It has **not** been pushed to `origin/gcp-booker` on GitHub, and the GCP VM
   has **not** pulled it — confirmed the VM's `run_monitor.sh` executes successfully right now
   (5 clean `time ./run_monitor.sh` runs, no `IndentationError`), meaning the VM's current
-  checkout predates `digvijayv`'s three broken commits and is unaffected by any of this.
+  checkout predates the contributor's three broken commits and is unaffected by any of this.
   **Do not `git pull` on the VM before pushing the fix to origin first** — pulling now would pull
   whatever is currently on `origin/gcp-booker`, which (unless already pushed) is still the broken
   state from 9.1.
@@ -697,7 +698,7 @@ the spec.
 ### 10.4 Two incidents worth recording
 
 1. **The monitor was down for ~45 minutes and nobody would have known.** `git pull` brought
-   digvijayv's `lxml`-using monitor onto a VM whose venv never had `lxml` installed (it postdates
+   the contributor's `lxml`-using monitor onto a VM whose venv never had `lxml` installed (it postdates
    the venv). Every cron tick died with `bs4.exceptions.FeatureNotFound`; `grep -c "MONITOR
    FAILURE" monitor.log` showed 135. The failure-alert cooldown (1.5h) meant a single Telegram
    alert covered the whole outage. Fixed with `venv/bin/pip install lxml`, and hardened
@@ -770,7 +771,7 @@ materially changes the design.
 
 - `estonia_visa_monitor.py` is **live and healthy** on the VM after the `lxml` fix, logging
   `NOT available` normally at the 10s cadence.
-- Commits `5dc496b` (the digvijayv regression fixes from section 9.1) and `63a0ddd` **have now been
+- Commits `5dc496b` (the contributor's regression fixes from section 9.1) and `63a0ddd` **have now been
   pushed and pulled onto the VM** — section 9's warning about them being unpushed is resolved.
 - The Playwright booker remains the live booking path (`ENABLE_BOOKER` set, cron pointed at
   `estonia_visa_monitor_booker_hook.py`). It is unchanged apart from the opt-in tracing. Nothing
