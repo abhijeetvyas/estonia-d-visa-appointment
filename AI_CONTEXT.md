@@ -8,8 +8,9 @@ before making any changes.
 
 Repo: `https://github.com/abhijeetvyas/estonia-d-visa-appointment`
 Human owner: Abhijeet Vyas.
-Live branch: **`main`** (renamed from `gcp-daemon` on 2026-08-22 — see the update note below) is the current branch to work from — see `BOOKER_README.md`'s
-Parked-Session Booker Daemon section. `gcp-setup` was the original detection-only branch, and
+Live branch: **`main`** (renamed from `gcp-daemon` on 2026-08-22 — see the update note below) is the current branch to work from — see `README.md`'s
+Booker/daemon section (originally a separate `BOOKER_README.md`, merged into the main README once
+the repo went public). `gcp-setup` was the original detection-only branch, and
 `gcp-booker` came next — it added a Playwright-driven auto-booker on top of the original monitor
 (see section 8 for its full reasoning trail) — before development continued on to `gcp-daemon`.
 As of the `gcp-booker` era described in sections 9-10 below, `gcp-booker` had been extensively
@@ -140,10 +141,11 @@ speculation:
   CPU burst credits under sustained load (confirmed directly against the GCP Monitoring CPU
   Utilization graph — visible spikes to 200%, i.e. both shared vCPUs pegged, during back-to-
   back dry-runs). This upgrade takes the VM out of Always Free eligibility and incurs real
-  billing — see `BOOKER_README.md`'s "VM sizing" section for the fallback machine-type order
-  (`n2d-standard-2`, `n1-standard-2`, `n2-standard-2`, `t2d-standard-2`, `e2-standard-4`) if
-  `e2-standard-2` hits a `ZONE_RESOURCE_POOL_EXHAUSTED` capacity stockout in this zone (a
-  transient GCP-side issue, not a config problem — happened repeatedly in `us-central1-a`).
+  billing. This detail was trimmed from the public README during the v0 cleanup, so it's recorded
+  here instead: if `e2-standard-2` hits a `ZONE_RESOURCE_POOL_EXHAUSTED` capacity stockout in this
+  zone (a transient GCP-side issue, not a config problem — happened repeatedly in `us-central1-a`),
+  the fallback machine-type order is `n2d-standard-2`, `n1-standard-2`, `n2-standard-2`,
+  `t2d-standard-2`, `e2-standard-4`.
 - **VM hostname**: `estonia-visa-monitor`. **Linux user**: `abhijeetvyas13`.
 - **Repo location on VM**: `/home/abhijeetvyas13/estonia-d-visa-appointment`, on branch
   `gcp-booker`.
@@ -551,7 +553,7 @@ see `run_booker()`'s calendar-extraction code) is itself stale/optimistic — i.
 as having capacity based on stale server-side state even when the actual per-slot inventory for
 that date is already empty, independent of how fast the booker runs. The existing 3-attempt retry
 loop with re-selection (added specifically to handle exactly this "date says available, slots come
-back empty" case, see section 8's "Time-slot retry" note in `BOOKER_README.md`) already assumes
+back empty" case — see section 8 above, and the retry logic itself in the code) already assumes
 hypothesis (b) is at least partially true, but 5/5 failures despite that retry loop suggests either
 the retry window (3 attempts, 3s apart, ~9-15s total) still isn't enough, or something more
 structural is going on. A future agent picking this up should treat this as the highest-leverage
@@ -561,15 +563,13 @@ open question, not booker-vs-monitor speed tuning in isolation.
 
 For a future agent asked to "improve" booking speed/success rate: the following are already
 implemented and reasoned through in this codebase (with the specific reasoning already documented
-in `AI_CONTEXT.md` section 8 and `BOOKER_README.md`) — re-proposing any of these from scratch
-wastes a turn:
+in section 8 above) — re-proposing any of these from scratch wastes a turn:
 
 - Background CAPTCHA prefetching for both reCAPTCHAs, started at the very beginning of
   `run_booker()`, before the browser even launches (section 8, "Background CAPTCHA prefetching").
 - `CAPTCHA_PROVIDER=race` mode — fires CapSolver and 2captcha concurrently, keeps whichever
   finishes first (section 8, `_race_solve_recaptcha`). Currently the default in
-  `run_booker_dryrun.sh` and mentioned as available in `BOOKER_README.md`, but check
-  `run_monitor.sh` on the VM for what's actually set live (it currently sets
+  `run_booker_dryrun.sh`, but check `run_monitor.sh` on the VM for what's actually set live (it currently sets
   `CAPTCHA_PROVIDER=race` per the crontab dump taken this session).
 - Persistent warm Chromium via CDP (`persistent_chromium.py` + systemd service) to skip the
   10-30s+ cold-launch cost — falls back to fresh launch automatically if unreachable.
@@ -676,8 +676,7 @@ the spec.
   tale in this file: one measurement plus a plausible mechanism is not evidence. Practical
   consequence — polling faster spends the seat's budget faster, so renewal must be driven by
   request count (`SEAT_RENEW_AFTER_REQUESTS`, default 70), with the time threshold kept only as a
-  secondary backstop. See IMPLEMENTATION_CHANGELOG.md §11 and BOOKER_README.md's "Seat lifetime is
-  a request budget, not a clock".
+  secondary backstop.
 - **F6.** Once past the CAPTCHA gate, a date's free-times query needs no CAPTCHA and takes
   195-620ms (median ~490ms over 95 polls). Repeatable indefinitely at zero cost.
 - **F7.** The service dropdown reflects **live inventory**, not a schedule. Proven accidentally:
@@ -764,8 +763,16 @@ book manually), and **every failure must log which step failed**.
 **Can the available-dates list be refreshed inside a live seat without a new CAPTCHA?** A seat
 acquired during episode 1 needs to see a *new* date appearing in episode 2. Unknown whether the
 step-5 response carries a fresh `data-vastuvotukuupaevad`, or whether another no-CAPTCHA route
-exists. This is R17 in the spec and is flagged as a stop-and-check point, because a negative answer
-materially changes the design.
+exists.
+
+**Update:** implemented as `resolve_r17_refresh_dates()` in `estonia_booking_http.py` (a step-4
+replay), plus a self-healing detector in the daemon that reacquires a fresh seat if the refresh
+looks suspect (empty results while a trigger is still fresh — see §11.2 below). It was never
+isolated and verified against the live site on its own, but the daemon it's part of went on to
+complete a real, successful booking end to end in production (`BOOKING_SUCCESS` in `daemon.log`,
+2026-08-05), which required the whole parked-seat-across-episode-gaps flow — including this
+refresh — to have worked well enough in practice. Treat it as "working, not formally verified in
+isolation" rather than "unresolved."
 
 ### 10.9 Deploy status as of the end of this session
 
@@ -779,3 +786,189 @@ materially changes the design.
 - The daemon does not exist yet. Implementation was deliberately handed to a separate, cheaper
   session working from the spec, with a required changelog mapping every requirement ID so the
   result can be reviewed against the spec rather than by reading all the code.
+
+## 11. The daemon's design decisions and requirements, folded in from `SPEC - Parked Session
+Booker Daemon.md` (the spec itself has been deleted as part of the v0 public-library cleanup)
+
+The spec's job was to hand a fresh implementation session a complete, self-contained brief. It
+numbered every requirement `R1`-`R42` so a required changelog (`IMPLEMENTATION_CHANGELOG.md`)
+could map implementation back to spec line-by-line for review. That numbering has now been
+scrubbed from the code comments and test names throughout the codebase, because the owner judged
+it no longer useful once the implementation is done and working — a comment that says "handles
+the edge case where the date list looks stale" doesn't need "(R17)" appended to be understood, and
+tying comments to a document that no longer exists is a liability, not a feature. This section
+exists so that the reasoning the spec captured isn't lost along with the numbering. The measured
+facts it was built on (F1-F10) are already summarised in §10.3 above; what follows is everything
+else worth keeping: the design itself, what was required and why, the cost model, the failure
+modes it was built to survive, and what was tested.
+
+### 11.1 The core idea and what a real episode looks like under it
+
+Getting past the CAPTCHA gate costs ~20 seconds, but the resulting session ("a **seat**") then
+stays alive for a long time and can check real free-times for free (F5-corrected: bounded by
+request count, not a clock — see §10.3). So: pay the 20 seconds once, early, then sit parked on
+the calendar page and watch. When a slot appears, submit immediately using a pre-solved spare
+CAPTCHA token, rather than starting a fresh ~20s solve at the exact moment speed matters most.
+
+A worked example of the timeline this produces, given F9's "episodes cluster 4-7 minutes apart"
+and the ~20-minute operating seat lifetime that was chosen (see §11.2):
+
+```
+T+0s     Monitor's cron tick detects D-visa. Writes a trigger file.
+T+0.5s   Daemon notices the trigger file.
+T+0.5s   Daemon starts a CAPTCHA solve AND begins the HTTP flow in parallel.
+T+20s    CAPTCHA lands. Daemon completes the flow and is parked on the calendar.
+         >>> SEAT ACQUIRED. Also starts keeping a spare CAPTCHA token fresh. <<<
+T+20s    Polls free-times every 2s. If a slot is already there, books it now.
+...      Episode ends, D-visa disappears. Daemon keeps the seat and keeps polling.
+T+300s   Next episode. A slot appears in the poll within 2s.
+T+301s   Daemon submits, using the pre-solved spare token.
+         >>> BOOKED, ~1 second from slot appearing. <<<
+T+1200s  Seat is 20 minutes old. Daemon acquires a replacement seat (1 CAPTCHA)
+         while the old one is still alive, then swaps, well ahead of expiry.
+```
+
+The constraint that shapes all of this is F8: a seat can only ever be acquired opportunistically,
+after D-visa is actually detected — never held continuously in advance. F9 (episodes cluster
+tighter than a seat's lifetime) is what makes one seat cover several episodes despite that
+constraint.
+
+### 11.2 What was required, and why — by category
+
+These are the decisions the spec locked in before implementation started. They describe intent;
+for exact current behaviour, read the code (`estonia_booker_daemon.py`, `estonia_booking_http.py`)
+and its comments, which are now self-explanatory without needing this section as a decoder key.
+
+**Non-regression (the highest priority of all of it).** `estonia_visa_monitor.py` must never be
+modified, the existing six-line staggered 10s cron must keep working unchanged, and no failure or
+hang in the daemon may ever affect the monitor — separate process, separate lock, separate log. If
+the daemon is stopped or never started, behaviour must be identical to a system with no daemon at
+all. Rationale, stated explicitly by the owner: even if automated booking fails completely, he
+must still get the alert and be able to book by hand. Detection is the safety net and must never be
+coupled to the booking experiment.
+
+**Trigger mechanism.** The monitor's hook writes a small trigger file on detection (wrapped so any
+exception there can never touch the alerting path); the daemon polls for a fresher timestamp every
+0.5s. The daemon does not run its own independent site check by default — that would triple
+request volume against a government portal that already added a CAPTCHA specifically to deter
+this kind of traffic. (`DAEMON_SELF_DETECT` exists as an explicit opt-in, default off.)
+
+**Seat lifecycle.** On trigger, if no seat is live, acquire one (CAPTCHA solve plus the HTTP flow
+run concurrently). Operate on a 20-minute working lifetime even though the measured hard ceiling
+is longer (§10.3, F5-corrected) — the margin is deliberate: renewing slightly early costs a
+fraction of a cent, renewing too late loses the seat mid-episode, and the ceiling was only ever
+measured under one specific polling cadence. Renewal must be *overlapping* — acquire and verify a
+replacement while the old seat is still alive, then swap atomically, never leaving a gap. Only
+renew if D-visa is still actually offered (F8); if not, let the old seat expire and go back to
+waiting. Detect seat death *positively* — a response with a CSRF token but no date input field —
+rather than inferring it from an empty slot list, because "seat is dead" and "this date genuinely
+has no free times right now" must never be confused. Cap concurrency at one live seat plus at most
+one in-flight replacement, to bound CAPTCHA spend.
+
+**Slot polling.** Poll free-times on a short fixed interval while a seat is live. Query dates
+*sequentially*, never in parallel — the server tracks a "currently selected date" in session
+state, and concurrent queries against the same session can corrupt it. An empty result on every
+date is the normal, expected case and must never be treated as an error.
+
+**Booking.** Book immediately on the first poll that returns any slot — no extra validation round
+trips, because speed is the entire point of this design. If the preferred date yields no slots,
+try every other available date before giving up (the old Playwright booker's biggest known gap was
+giving up after exactly one date). Booking needs a CAPTCHA token; use the pre-solved reserve, and
+if it's empty or stale, solve on demand and log loudly that the fast path was missed. After a
+confirmed booking, keep monitoring and keep the daemon running — round 6 (§12.3-12.4 of
+`IMPLEMENTATION_CHANGELOG.md`, if still present) later changed the "stop once booked" behaviour
+entirely into "keep hunting for anything strictly earlier," at the owner's explicit request; see
+that changelog (or its addendum) for the reasoning, since it postdates and supersedes this
+original requirement.
+
+**CAPTCHA token reserve.** While a seat is live, keep one freshly-solved spare token on hand,
+refreshed well before its usable age expires, and never hand out one older than a hard age cap —
+discard and solve fresh instead. Only run the reserve while a seat is live, which is what keeps
+the cost bounded (§11.3). Use the primary solver alone for the reserve, not a racing multi-provider
+strategy — nothing ever waits on a background reserve solve, so racing would double cost for zero
+latency benefit; racing is reserved for the on-demand fallback path, where latency is everything.
+Cap total solves per hour as a runaway-spend guard: on breach, stop solving, alert, and keep the
+monitor and the existing seat running regardless. Poll the solver's account balance periodically
+and alert below a low-balance threshold — a reserve that silently runs dry leaves the system slower
+than having no daemon at all, with no visible signal, which is exactly what this alert prevents.
+
+**Logging and alerting.** Every state transition (seat acquired/renewed/swapped/died/expired, poll
+result, slot found, booking attempted/succeeded/failed, token refreshed/stale, balance low, rate
+limit hit) gets one UTC ISO-8601 log line, with elapsed-time-since-trigger included. Every poll is
+also appended to a CSV (timestamp, seat age, date, slot count/times, query latency, seat-alive
+flag) — this dataset is what would finally answer, with data instead of guesswork, whether a given
+embassy's slots ever really exist. Any booking failure dumps the full response HTML to disk and
+references the path in the log, because "it didn't work" with no artifact is what made the early
+real failures so expensive to diagnose (see §10.4's incidents and §12.1 of the changelog). Telegram
+fires on seat-acquired, booking success/failure (naming which step failed), low balance, rate
+limit, and daemon start/clean-shutdown — deliberately never on routine polls, which would be pure
+noise at a 2-second cadence.
+
+**Operations.** Ship as a systemd unit, `Restart=always`, running as the same user and with the
+same env vars as the monitor. Handle `SIGTERM` cleanly (finish in-flight work, log shutdown, exit
+0). A single-instance lock so two daemons can never run concurrently. Every new env var documented
+with its default (now in `README.md`, since `BOOKER_README.md` was merged into it).
+
+### 11.3 Cost model
+
+CapSolver reCAPTCHA v2 solves were priced at roughly $0.0008 each. Combined seat-renewal cost
+(~1 solve per ~20 minutes of active holding) plus the token-reserve cost (~1 solve per ~75s of
+active holding) came to roughly **$0.10/hour of actively holding a seat**. Given F9's ~3-8 episode
+clusters/day and up to ~40 minutes of active holding per cluster, that worked out to **roughly
+$6-15/month** in practice. The hourly solve-rate cap (§11.2) bounds the absolute worst case — a
+seat somehow held permanently — at roughly $35/month. The account balance at spec-writing time was
+$7 (~8,750 solves), comfortable for development but the balance alert (§11.2) is what matters once
+this runs unattended for real.
+
+### 11.4 Failure modes the daemon was built to survive
+
+| Failure | Required behaviour |
+|---|---|
+| CAPTCHA solver down or out of credit | Log, alert, keep the seat and keep polling — monitor unaffected |
+| Seat dies early (site restart, IP change) | Detect via the positive death signature, log, re-acquire if D-visa is still offered |
+| D-visa disappears while parked | Keep the seat, keep polling |
+| Site returns 5xx / times out | Exponential backoff, capped, never spin |
+| Site markup changes | Any step that can't find its expected element raises with the step name, dumps the HTML, alerts — never fails silently |
+| Booking submitted, confirmation unclear | Do **not** mark it booked; alert the owner to check the portal manually (a real 2026-08-03 event submitted a real booking with an ambiguous confirmation check — one date-format marker could never match the site's actual rendering, and there was no negative check either, so "no positive marker" and "the site said 'Booking failed'" looked identical; both were fixed, and the structural `<a href="/en/delete?id=...">` link is now the primary positive signal, checked first, with a hard negative override) |
+| Two slots grabbed simultaneously by daemon and owner | Owner-facing risk only; the booked-state flag is what stops all further daemon attempts |
+| Daemon crash loop | systemd restart with a backoff; alert if restarts happen too many times in too short a window |
+
+### 11.5 What was tested, and against what
+
+Never against New Delhi (the real target embassy) — always against an embassy with standing
+availability (Abu Dhabi, Cairo, Astana), so testing never competes with a real booking attempt.
+The spec's test plan covered: the pure preference/fallback logic as unit tests (this is what
+`test_daemon_units.py` now covers, expanded well beyond the original plan across several rounds of
+fixes — see that file's own module docstring); a live seat acquisition and a multi-minute poll
+loop against a real embassy; forcing an early overlapping renewal and a forced seat-death past its
+lifetime, to prove both paths behave correctly; a full `DAEMON_DRY_RUN=1` run that stops right
+before the final submit; one real submit-plus-delete against a real embassy, with explicit
+verification that the delete actually succeeded (see §10.4's second incident — a prior test's
+cleanup silently no-opped and left a live dummy booking); killing the daemon mid-poll to confirm
+the monitor is unaffected; and pointing the solver credentials at an invalid key to confirm
+graceful degradation rather than a crash loop. `applicant_data_dummy.json` (safe, non-personal
+values) is what all of the above is meant to run against.
+
+### 11.6 Explicit non-goals (still true, worth keeping in mind before "improving" this)
+
+- Do not modify `estonia_visa_monitor.py`, or its cron schedule/cadence.
+- Do not delete the old Playwright booker (`estonia_d_visa_booker.py`) — it stays as an
+  intentional fallback, not dead code.
+- Do not reintroduce Playwright/browser-profile experiments into the HTTP daemon path — F4 (§10.3)
+  already showed the browser has no effect on CAPTCHA difficulty.
+- Do not build a continuously-running, 24/7 CAPTCHA token reserve — the chosen design's
+  only-while-a-seat-is-live reserve was deliberately chosen over that for cost reasons (§11.3).
+- Do not add an LLM anywhere in the runtime path — considered and rejected repeatedly; see §2.
+
+### 11.7 Operational quirks worth remembering (not otherwise recorded in this file)
+
+- Always invoke Python by its absolute venv path (`venv/bin/python3`) in cron/systemd contexts —
+  shell activation has been observed to fail intermittently under cron.
+- `REQUESTS_CA_BUNDLE` must point at a combined CA bundle file. The site does not send its full TLS
+  certificate chain, and `requests` (unlike a browser) does not chase the AIA extension to build
+  the rest of the chain itself.
+- `run_monitor.sh` holds all real secrets and is intentionally not committed to git — it exists
+  only on the VM. (See the main README for how a fresh VM sets this file up.)
+- When editing the crontab by hand over SSH, build the file via a heredoc and load it with
+  `crontab <file>` — browser-based SSH terminals have been observed to mangle multi-line pastes
+  into `nano`.
