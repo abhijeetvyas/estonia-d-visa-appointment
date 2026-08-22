@@ -24,12 +24,13 @@ tokens for no benefit, since the logic doesn't change between runs. The right pl
 LLM here is at build time (writing/debugging the script), not at execution time.
 
 **Why not rely on GitHub Actions' built-in `schedule` trigger?**
-It's kept in this repo (`.github/workflows/estonia-visa-monitor.yml`) as a fallback/reference,
-but it is not the primary way this runs. GitHub's own cron scheduler is explicitly "best
-effort," and for anything more frequent than about an hour on a low-traffic personal repo, it
-can drift badly — schedules that should fire every 15 minutes were observed firing as
-infrequently as every 1–1.5 hours. That's not acceptable for a monitor whose whole value is
-speed.
+It's kept in this repo (`.github/workflows/estonia-visa-monitor.yml`) as a documented,
+disabled-by-default alternative — see "Running just the GitHub Actions monitor (no VM
+needed)" below — but it is not the primary way this runs. GitHub's own cron scheduler is
+explicitly "best effort," and for anything more frequent than about an hour on a low-traffic
+personal repo, it can drift badly — schedules that should fire every 15 minutes were observed
+firing as infrequently as every 1–1.5 hours. That's not acceptable for a monitor whose whole
+value is speed.
 
 **Why a self-hosted VM instead of any cloud scheduler (GitHub Actions, cron-job.org, etc.)?**
 Two separate problems pushed this direction:
@@ -84,7 +85,6 @@ calls in a row means calling a fourth time immediately isn't help, it's noise.
 sudo apt update && sudo apt install -y python3-pip python3-venv git
 git clone https://github.com/abhijeetvyas/estonia-d-visa-appointment.git
 cd estonia-d-visa-appointment
-git checkout gcp-setup   # this branch has the GCP-specific fixes; main is the original GitHub-Actions-only version
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -266,7 +266,7 @@ nano run_monitor.sh                    # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, T
 ### Pulling code updates
 
 ```bash
-git status                              # confirm you're on gcp-setup and see any local diffs
+git status                              # see any local diffs
 git pull                                # fetch latest from the tracked branch
 ```
 
@@ -296,6 +296,37 @@ Then retry the original `git add`/`commit`/`push` command.
 | Not found | Nothing (silent) | Nothing |
 | Script failure | One alert, then 1.5h cooldown before repeating | Never — failures are frequent/expected during outages and shouldn't ring anyone |
 | Test run (`TEST_TELEGRAM=true`) | Always sent | Always placed, ignores cooldown |
+
+---
+
+## Running just the GitHub Actions monitor (no VM needed)
+
+This repo also ships a plain GitHub Actions workflow
+(`.github/workflows/estonia-visa-monitor.yml`) that runs
+`estonia_visa_monitor.py` on GitHub's own infrastructure — no VM, no
+daemon, no auto-booking. Good enough if you just want a Telegram ping when
+a slot opens and are fine handling the booking yourself.
+
+**It's disabled by default** (the `schedule:` trigger is commented out in
+the workflow file) so it won't run automatically the moment you clone/fork
+this repo. To turn it on:
+
+1. Add two repo secrets: Settings → Secrets and variables → Actions → New
+   repository secret:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+2. (Optional) To target an embassy other than New Delhi, add `EMBASSY_ID` /
+   `EMBASSY_NAME` as repo variables or edit the `env:` block in the
+   workflow file — the script is already parameterized for this.
+3. Open `.github/workflows/estonia-visa-monitor.yml` and uncomment the
+   `schedule:` block (instructions are inline in the file) to enable the
+   every-15-minutes cron. Or leave it commented out and just trigger runs
+   manually from the Actions tab → "Estonia D-Visa Slot Monitor" → **Run
+   workflow** whenever you want an on-demand check.
+
+This is the lighter-weight sibling of the full VM+daemon setup described
+above — see `BOOKER_README.md` if you also want automatic booking once a
+slot is detected, not just an alert.
 
 ---
 
