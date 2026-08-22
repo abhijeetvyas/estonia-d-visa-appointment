@@ -2,8 +2,7 @@
 """
 Reusable, browserless HTTP implementation of the broneering.mfa.ee booking
 flow, extracted from the proven, measured code in `probe_http_flow.py` and
-`test_session_longevity.py` (see `SPEC - Parked Session Booker Daemon.md`,
-sections 5 and 11 step 1).
+`test_session_longevity.py` (both kept in `research/` for reference).
 
 This module intentionally contains NO polling loop, NO trigger-file watching,
 and NO Telegram/logging side effects of its own - it is pure HTTP-flow
@@ -13,11 +12,10 @@ scheduling, state, and alerting decisions. Keeping this file side-effect-free
 unit-testable and reusable from `probe_http_flow.py`-style throwaway scripts
 too, without dragging in daemon concerns.
 
-ROUND-2 FOLLOW-UP FIX 3 - ONE DELIBERATE EXCEPTION TO "no side effects of its
-own": this module now owns a single, global, thread-safe rate limiter
+ONE DELIBERATE EXCEPTION TO "no side effects of its
+own": this module owns a single, global, thread-safe rate limiter
 (`RateLimiter`, singleton `_RATE_LIMITER`) that EVERY outbound request to
-broneering.mfa.ee passes through via the `_throttled()` helper - see
-IMPLEMENTATION_CHANGELOG.md §8 (Fix 3) for the full rationale. This is a
+broneering.mfa.ee passes through via the `_throttled()` helper. This is a
 safety net, not a tuning knob: no future bug in any call path (daemon,
 `probe_http_flow.py`, a throwaway script, anything importing this module) can
 produce runaway traffic against a site that has already added a CAPTCHA in
@@ -35,20 +33,18 @@ below. In particular:
   F2  Both reCAPTCHAs are enforced server-side - there is no bypass.
   F5  A session lasts exactly 1440s and does not extend on activity. Death
       signature: response has a CSRF token but no
-      `input[name="broneering[kuupaev]"]` (R13).
+      `input[name="broneering[kuupaev]"]` - this means the site bounced
+      us back to the start of the form.
   F6  Once past the CAPTCHA gate, a free-times query needs no CAPTCHA and is
       fast (~200-600ms).
 
-R17 (this module's open question - see `resolve_r17_refresh_dates` below):
-can the available-dates list be refreshed inside a live seat without a new
-CAPTCHA? This module implements the spec's suggested no-CAPTCHA route
-(re-POSTing the applicant-details step, which carries no
-`g-recaptcha-response` field at all) and documents in
-`IMPLEMENTATION_CHANGELOG.md` §4 that this could not be verified against the
-live site in the implementation session (no network egress to
-broneering.mfa.ee was available in that sandbox) - it must be verified for
-real before being trusted, exactly as the spec's "stop and flag" instruction
-in §11 step 3 requires.
+Open question this module has to answer (see `resolve_r17_refresh_dates`
+below): can the available-dates list be refreshed inside a live seat without
+a new CAPTCHA? This module implements a no-CAPTCHA route (re-POSTing the
+applicant-details step, which carries no `g-recaptcha-response` field at
+all), but as of this writing it had not been verified against the live site
+(no network access to broneering.mfa.ee was available while writing it) -
+it must be verified for real before being trusted.
 """
 
 from __future__ import annotations
@@ -90,12 +86,14 @@ TURBO_HEADERS = {
     "Referer": URL,
     "Origin": "https://broneering.mfa.ee",
 }
-# `edasi` / `broneeri` steps override Accept per spec §5.
+# `edasi` / `broneeri` steps override Accept to a plain-HTML type
+# (rather than the Turbo-stream type used elsewhere) since those two steps
+# return a full-page navigation response, not a Turbo fragment.
 FULL_HEADERS = {**TURBO_HEADERS, "Accept": "text/html, application/xhtml+xml"}
 
 
 # ---------------------------------------------------------------------------
-# Round-2 follow-up Fix 3: a hard, global outbound rate ceiling
+# A hard, global outbound rate ceiling
 # ---------------------------------------------------------------------------
 #
 # Every request this module makes to broneering.mfa.ee - across every call
@@ -109,8 +107,8 @@ FULL_HEADERS = {**TURBO_HEADERS, "Accept": "text/html, application/xhtml+xml"}
 
 
 def _log(msg: str) -> None:
-    """Minimal standalone logger - see the module docstring's "ROUND-2
-    FOLLOW-UP FIX 3" note for why this one function exists despite the rest
+    """Minimal standalone logger - see the "hard, global outbound rate
+    ceiling" note above for why this one function exists despite the rest
     of the module deliberately having no logging side effects."""
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(f"{ts} [estonia_booking_http] {msg}", flush=True)
@@ -202,7 +200,7 @@ class RateLimiter:
             self._sleep(wait_time)
 
 
-# Round 10: burst raised 3 -> 10. The SUSTAINED rate is unchanged at 1 req/s,
+# Burst raised from 3 to 10. The SUSTAINED rate is unchanged at 1 req/s,
 # so the load this places on the site is identical - but seat acquisition
 # fires 7 requests back to back, and with a burst of 3 the limiter was
 # throttling the one moment that matters. Measured on 2026-08-03: a
@@ -221,16 +219,16 @@ def _throttled(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     Every `session.get(...)`/`session.post(...)` call to the live site in
     this module goes through this - see the section comment above.
 
-    Round-5 Fix 16: this is also where per-session request counting happens.
+    This is also where per-session request counting happens.
     Measurements on 2026-08-02 (three runs at three different poll cadences)
     showed a session expires after roughly 95-100 REQUESTS, not after any
     fixed wall-clock duration - the original "1440 seconds" figure turned out
     to be an artifact of that one measurement having polled every 15s
-    (~98 requests happens to land at ~1442s). See IMPLEMENTATION_CHANGELOG.md
-    §11 and AI_CONTEXT.md F5's correction.
+    (~98 requests happens to land at ~1442s). See AI_CONTEXT.md's note on
+    this correction.
 
     Counting here rather than at each call site is deliberate: this function
-    is already the single unbypassable chokepoint for site traffic (Fix 3),
+    is already the single unbypassable chokepoint for site traffic,
     so a request cannot be made without being counted. The counter lives on
     the `requests.Session` because that IS the unit the server's budget
     applies to - which also means setup requests (steps 0-4, plus the
@@ -251,8 +249,8 @@ def _throttled(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 class BookingHttpError(RuntimeError):
     """Raised when a step fails in a way that should be treated as a markup
     change / unexpected condition, not routine 'no slots'. Callers (the
-    daemon) are expected to dump the offending HTML and alert (R33-R38 /
-    the failure-mode table in spec §8: 'Site markup changes')."""
+    daemon) are expected to dump the offending HTML and alert - this is a
+    'the site's markup changed' condition, not a routine failure."""
 
     def __init__(self, step: str, message: str, html: str = ""):
         super().__init__(f"[{step}] {message}")
@@ -262,11 +260,11 @@ class BookingHttpError(RuntimeError):
 
 class SeatDeadError(RuntimeError):
     """Raised by query_free_times()/refresh_dates() when the seat-death
-    signature (R13) is detected: a response still carries a CSRF token but
+    signature is detected: a response still carries a CSRF token but
     the date field (`input[name="broneering[kuupaev]"]`) is gone - i.e. we
-    were bounced back to the start of the form (F5).
+    were bounced back to the start of the form.
 
-    Round-5 Fix 18: carries the offending response body. Seat death has only
+    Carries the offending response body. Seat death has only
     ever been *inferred* from that selector signature - nobody has looked at
     what the server actually returns. A validation-error page would match the
     same signature, so a real dump is the only way to tell a genuine session
@@ -293,7 +291,7 @@ class Slot:
 class Seat:
     """A live, authenticated, parked session sitting on the calendar page.
 
-    One `requests.Session` per seat so cookies persist (spec §5). The CSRF
+    One `requests.Session` per seat so cookies persist. The CSRF
     token rotates on every response and must be tracked here, not captured
     once.
     """
@@ -311,7 +309,7 @@ class Seat:
 
     @property
     def requests_used(self) -> int:
-        """Round-5 Fix 16: how many site requests this seat's session has
+        """How many site requests this seat's session has
         made, including the ~5 spent establishing it. Read straight off the
         session (incremented in `_throttled`) rather than tracked separately,
         so it cannot drift out of sync with reality.
@@ -345,12 +343,12 @@ def _iso_to_ddmmyyyy(iso: str) -> str:
 
 
 def is_seat_dead(html: str) -> bool:
-    """R13: positive seat-death detection. A live session always echoes a
+    """Positive seat-death detection. A live session always echoes a
     fresh CSRF token; a dead one still has a token but has been bounced to
     the start of the form, where the date field no longer exists. Do NOT
     infer death from an empty slot list - that is either a normal poll
     result or an expired seat, and conflating the two defeats the entire
-    point of this design (§6.3, R13)."""
+    point of this design."""
     soup = BeautifulSoup(html, HTML_PARSER)
     token = soup.find("input", {"name": "broneering[_token]"})
     date_field = soup.find("input", {"name": "broneering[kuupaev]"})
@@ -413,12 +411,14 @@ def establish_seat(
     captcha_token: str,
     session: Optional[requests.Session] = None,
 ) -> Seat:
-    """Steps 0-4 of spec §5. Requires an already-solved reCAPTCHA token for
-    step 3's gate (F2 - there is no bypass). Raises BookingHttpError with a
-    step name on any unexpected markup so the caller can dump+alert (spec §8:
-    "Site markup changes"). Raises RuntimeError("no_dvisa") if D-visa is not
-    currently offered (F8) - callers must check this before spending a
-    CAPTCHA solve.
+    """Establishes a new seat (steps 0-4 of the booking flow). Requires an
+    already-solved reCAPTCHA token for step 3's gate - there is no bypass,
+    both reCAPTCHAs on this site are enforced server-side. Raises
+    BookingHttpError with a step name on any unexpected markup so the caller
+    can dump the HTML and alert - this means the site's markup changed.
+    Raises RuntimeError("no_dvisa") if D-visa is not currently offered -
+    callers must check this before spending a CAPTCHA solve, since you
+    cannot establish a session for a service that isn't currently offered.
     """
     s = session or new_session()
 
@@ -512,42 +512,41 @@ def establish_seat(
 
 
 # ---------------------------------------------------------------------------
-# R17: refreshing the available-dates list within a live seat, no CAPTCHA
+# Refreshing the available-dates list within a live seat, no CAPTCHA
 # ---------------------------------------------------------------------------
 
 def resolve_r17_refresh_dates(seat: Seat) -> list[str]:
     """
     Attempts to refresh `available_dates` on an already-established seat
-    WITHOUT spending a new CAPTCHA. This directly answers spec R17: a seat
-    acquired during episode 1 must be able to see a *new* date that appears
-    in episode 2, or the whole "one seat covers several episodes" design
-    (F9) doesn't actually work for dates outside what was visible at
-    acquisition time.
+    WITHOUT spending a new CAPTCHA. This matters because a seat acquired
+    during one availability window needs to be able to see a *new* date
+    that appears in a later window, or the whole "one seat covers several
+    episodes" design doesn't actually work for dates outside what was
+    visible at acquisition time.
 
-    Approach taken (per spec §6.4's suggestion): re-POST the applicant
-    -details step (step 4). That endpoint carries no `g-recaptcha-response`
-    field at all in the original flow - it is a POST-only-effect operation
-    downstream of the CAPTCHA gate, not gated by one itself - so replaying it
-    with the same applicant data should be a legitimate, no-CAPTCHA way to
-    re-render the calendar element and read a fresh
-    `data-vastuvotukuupaevad` attribute, if the site recomputes it on every
-    render (as opposed to baking it in once at session start).
+    Approach taken: re-POST the applicant-details step (step 4). That
+    endpoint carries no `g-recaptcha-response` field at all in the original
+    flow - it is a POST-only-effect operation downstream of the CAPTCHA
+    gate, not gated by one itself - so replaying it with the same applicant
+    data should be a legitimate, no-CAPTCHA way to re-render the calendar
+    element and read a fresh `data-vastuvotukuupaevad` attribute, if the
+    site recomputes it on every render (as opposed to baking it in once at
+    session start).
 
-    IMPORTANT - not verified against the live site in the implementation
-    session: this sandbox has no network egress to broneering.mfa.ee (see
-    IMPLEMENTATION_CHANGELOG.md §4 for the specific evidence). The seat-death
-    check (`is_seat_dead`) IS still applied to whatever comes back, so a
-    dead seat is correctly detected even if the refresh mechanism itself
-    turns out not to work as designed - but whether this actually returns
-    an *updated* date list (vs. just the same one, or a rejected/garbled
-    response) must be confirmed with a real seat before being trusted
-    operationally. If live testing shows this does not refresh the list,
-    the fallback documented in the spec is a plain `GET /en/` within the
-    session - try that next; note that a plain GET returns a fresh landing
-    page (pre-embassy-selection) and its calendar data would need to be
-    re-derived by replaying steps 1-2 without a CAPTCHA (both are
-    CAPTCHA-free per F2/§5), which is a heavier fallback than the step-4
-    replay attempted here.
+    IMPORTANT - not verified against the live site as of this writing: no
+    network access to broneering.mfa.ee was available while writing this
+    function. The seat-death check (`is_seat_dead`) IS still applied to
+    whatever comes back, so a dead seat is correctly detected even if the
+    refresh mechanism itself turns out not to work as designed - but
+    whether this actually returns an *updated* date list (vs. just the
+    same one, or a rejected/garbled response) must be confirmed with a
+    real seat before being trusted operationally. If live testing shows
+    this does not refresh the list, the fallback is a plain `GET /en/`
+    within the session - try that next; note that a plain GET returns a
+    fresh landing page (pre-embassy-selection) and its calendar data would
+    need to be re-derived by replaying the embassy-selection and
+    service-selection steps without a CAPTCHA (both are CAPTCHA-free),
+    which is a heavier fallback than the step-4 replay attempted here.
     """
     applicant_replay = getattr(seat, "_applicant_cache", None)
     if applicant_replay is None:
@@ -611,19 +610,19 @@ def cache_applicant_on_seat(seat: Seat, applicant: dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 5: query free times (no CAPTCHA, repeatable) - R15, R16, R18
+# Step 5: query free times (no CAPTCHA, repeatable)
 # ---------------------------------------------------------------------------
 
 def query_free_times(seat: Seat, date_iso: str) -> list[Slot]:
-    """Queries bookable time slots for one date. No CAPTCHA required (F6).
-    Callers MUST query dates sequentially (R16) - the server tracks a
+    """Queries bookable time slots for one date. No CAPTCHA required.
+    Callers MUST query dates sequentially - the server tracks a
     "currently selected date" in session state and concurrent queries may
     corrupt it.
 
-    Raises SeatDeadError if the R13 death signature is detected. An empty
-    slot list on a *live* seat is a completely normal result (R18) - it
-    means the date genuinely has zero free times right now, not that
-    anything is wrong.
+    Raises SeatDeadError if the seat-death signature is detected (see
+    is_seat_dead). An empty slot list on a *live* seat is a completely
+    normal result - it means the date genuinely has zero free times right
+    now, not that anything is wrong.
     """
     d = _iso_to_ddmmyyyy(date_iso)
     r = _throttled(
@@ -661,7 +660,7 @@ def query_free_times(seat: Seat, date_iso: str) -> list[Slot]:
 
 
 # ---------------------------------------------------------------------------
-# Step 6: submit the booking (R19-R25) - requires a CAPTCHA token
+# Step 6: submit the booking - requires a CAPTCHA token
 # ---------------------------------------------------------------------------
 
 def submit_booking(
@@ -674,12 +673,12 @@ def submit_booking(
     """Submits the final booking. Returns (confirmed, response_text).
 
     `confirmed` is determined by the same page-text markers used throughout
-    this project (spec §5 step 6): "Booked time", "Add new booking", or the
-    date in DD.MM.YYYY form alongside "Delete". Per spec §8's failure-mode
-    table ("Booking submitted, confirmation unclear -> Do NOT set the booked
-    flag"), the caller must treat confirmed=False as "unknown outcome,
-    escalate" rather than "definitely failed" - a submit that times out or
-    returns something unexpected is NOT the same as a clean rejection.
+    this project: "Booked time", "Add new booking", or the date in
+    DD.MM.YYYY form alongside "Delete". If a booking is submitted but
+    confirmation is unclear, the caller must NOT set its "already booked"
+    flag - treat confirmed=False as "unknown outcome, escalate" rather than
+    "definitely failed", since a submit that times out or returns something
+    unexpected is not the same as a clean rejection.
     """
     d = _iso_to_ddmmyyyy(date_iso)
     r = _throttled(
@@ -755,7 +754,9 @@ def is_booking_confirmed(html: str, date_ddmmyyyy: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Step 7: delete (test cleanup only) - R T7's "verify the delete succeeded"
+# Step 7: delete (test cleanup only) - a prior test run left a live booking
+# because the delete step wasn't actually verified to have worked; always
+# confirm deletion succeeded, don't just assume no error means it did
 # ---------------------------------------------------------------------------
 
 def delete_booking(seat: Seat, confirmation_html: str) -> tuple[bool, str]:
