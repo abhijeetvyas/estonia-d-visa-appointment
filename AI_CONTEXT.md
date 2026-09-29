@@ -201,6 +201,8 @@ speculation:
   `call_count`) is persisted in the same per-embassy state file as the failure cooldown.
   `bypass_cooldown=True` is used only by the test path, so test calls always go through
   immediately regardless of real cooldown state.
+  If env var `ENABLE_TWILIO_CALLS` is `0`/`false`/`no`, the function logs and returns before
+  reading credentials or touching cooldown state (see section 5).
 - `send_availability_alert()`: sends Telegram, then `trigger_phone_calls()`, then
   `record_alert()` to the permanent alerts log. Called only when `found=True`.
 - `send_failure_alert()` / `handle_failure()`: Telegram only, never calls, by design (frequent
@@ -237,6 +239,7 @@ speculation:
 | `TWILIO_FROM_NUMBER` | Twilio phone number placing calls | E.164 format |
 | `TWILIO_TO_NUMBERS` | Recipient phone number(s) | Comma-separated, E.164 format, must be verified caller IDs if Twilio account is still on trial |
 | `TWILIO_TWIML_URL` | TwiML Bin URL (what the call says) | Created in Twilio console |
+| `ENABLE_TWILIO_CALLS` | Optional, defaults to enabled | Set to `0`/`false`/`no` (case-insensitive) to skip phone calls without removing Twilio credentials, e.g. while a trial account can't call certain regions. Checked at the top of `trigger_phone_calls()`, so it also silences test-run calls. Logs `Twilio calls disabled via ENABLE_TWILIO_CALLS=0` and returns. |
 | `EMBASSY_ID` | Optional, defaults to `'40'` (New Delhi) | Numeric `esindus` value from the site's own dropdown |
 | `EMBASSY_NAME` | Optional, defaults to `'New Delhi'` | Human-readable, used in alert text only |
 | `TEST_TELEGRAM` | Optional, unset by default | Set to `true` to trigger test-mode (see `send_test_alert`) |

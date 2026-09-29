@@ -209,6 +209,12 @@ def trigger_phone_calls(bypass_cooldown=False):
     real availability alerts and test runs — never for failure alerts, by
     design (failures are frequent/expected during outages and shouldn't ring
     anyone's phone repeatedly)."""
+    # Allow disabling Twilio calls entirely via env var, useful when trial
+    # account restrictions prevent calling certain numbers/regions
+    if os.environ.get('ENABLE_TWILIO_CALLS', '1').lower() in ('0', 'false', 'no'):
+        log_line('Twilio calls disabled via ENABLE_TWILIO_CALLS=0')
+        return
+
     account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
     auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
     from_number = os.environ.get('TWILIO_FROM_NUMBER')
