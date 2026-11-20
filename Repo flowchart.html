@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Estonia D-Visa Monitor &amp; Booker: Flow Chart</title>
+<style>
+:root{--bg:#ffffff;--card:#ffffff;--ink:#1f2328;--mute:#6b7280;--line:#d8dbe0;--core:#f6f7f9;--coreb:#9aa1ab;--failf:#ffffff;--failb:#b4494d;--quiet:#fafafa;--soft:#6b7280;--logf:#f6f7f9;--testf:#ffffff;--testb:#9aa1ab;--msg:#ffffff;--msgt:#1f2328;--tg:#4b5563;--tw:#4b5563;--cap:#4b5563;--site:#374151;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);color-scheme:light}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1240px;margin:0 auto;padding:26px 16px 56px}
+h1{font-size:clamp(1.5rem,3.4vw,2.1rem);margin:0 0 6px;letter-spacing:-.02em}h2{font-size:1.15rem;margin:34px 0 8px}
+.lead{color:var(--mute);max-width:80ch;margin:0 0 14px}
+.key{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.k{font-size:.78rem;font-weight:700;padding:4px 12px;border-radius:999px;color:#fff;white-space:nowrap}
+.k.tg{background:var(--tg)}.k.tw{background:var(--tw)}.k.cap{background:var(--cap)}.k.site{background:var(--site)}
+.k.msg{background:var(--msg);color:var(--msgt)}.k.fail{background:var(--failf);color:var(--failb);border:1.5px dashed var(--failb)}
+.k.test{background:var(--testf);color:var(--testb)}.k.log{background:var(--logf);color:var(--mute);border:1px solid var(--line)}.k.soft{background:transparent;color:var(--soft);border:1.5px dashed var(--soft)}
+.stats{display:flex;flex-wrap:wrap;gap:8px 22px;font-size:.88rem;color:var(--mute);margin:6px 0 14px}.stats b{color:var(--ink)}
+.scroll{overflow-x:auto;padding:0}
+svg{display:block;width:100%;min-width:1000px;height:auto;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.lane{fill:none;stroke:var(--line);stroke-width:1}
+.core{fill:var(--core);stroke:var(--coreb);stroke-width:1.2}
+.fail{fill:#fff;stroke:var(--failb);stroke-width:1.2;stroke-dasharray:5 3}
+.quiet{fill:var(--quiet);stroke:var(--line)}
+.cap2{fill:var(--core);stroke:var(--coreb);stroke-width:1.2}
+.logtag{fill:var(--logf);stroke:var(--line)}.testtag{fill:var(--testf);stroke:var(--testb)}
+.logbox{fill:var(--logf);stroke:var(--line)}.testbox{fill:var(--testf);stroke:var(--testb);stroke-dasharray:4 3}
+.site{fill:var(--site)}.tgp{fill:var(--tg)}.twp{fill:var(--tw)}.cap{fill:var(--cap)}
+.t,.nt,.ns,.tg,.pt,.numt,.msgt,.lt,.ls,.softt,.failt{pointer-events:none}
+.nt{font-size:13px;font-weight:700;fill:var(--ink)}.ns{font-size:10.5px;fill:var(--mute)}.tg{font-size:9.5px;fill:var(--mute)}
+.pt{font-size:12px;font-weight:700;fill:#fff}.lt{font-size:12px;font-weight:800;letter-spacing:.06em;fill:var(--ink)}.ls{font-size:11px;fill:var(--mute)}
+.failt{font-size:11px;font-weight:600;fill:var(--failb)}.softt{font-size:11px;font-weight:700;letter-spacing:.06em;fill:var(--soft)}
+.numc{fill:#4b5563}.numt{font-size:11px;font-weight:600;fill:#fff}
+.msgc{fill:#fff;stroke:#6b7280;stroke-width:1.2}.msgt{font-size:10.5px;font-weight:600;fill:var(--msgt)}
+.ar{fill:none;stroke:var(--mute);stroke-width:1.8}.arf{fill:none;stroke:var(--failb);stroke-width:1.8;stroke-dasharray:5 3}
+.soft{fill:none;stroke:var(--soft);stroke-width:1.8;stroke-dasharray:4 5;stroke-linecap:round}
+.mk{fill:var(--mute)}.mkr{fill:var(--failb)}.mks{fill:var(--soft)}
+.mtable{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:760px;font-size:.88rem;line-height:1.45}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--mute)}
+tr:last-child td{border-bottom:0}td:nth-child(2){white-space:nowrap}
+.mc{display:inline-block;border:1px solid #9aa1ab;color:var(--ink);font-weight:600;font-size:.78rem;padding:1px 9px;border-radius:999px}
+
+.note{color:var(--mute);font-size:.85rem;margin-top:10px}
+</style></head><body><div class="wrap">
+<h1>How the system fits together</h1><p class="note" style="margin:0 0 12px">Numbered circles show the order of events; boxed numbers are messages sent (see table below).</p>
+<div class="stats"><span><b>10 s</b> check interval</span><span><b>~1 s</b> per check</span><span><b>~20 s</b> CAPTCHA solve (12–40 s)</span><span><b>~5 s</b> slot to confirmed booking</span><span><b>~1 s</b> submit when already parked</span></div>
+<div class="scroll"><svg viewBox="0 0 1200 930" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Flow chart of the monitor and booker programs, their integrations, failure paths, logs and tests">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker><marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mkr"/></marker><marker id="ahs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mks"/></marker></defs>
+<rect x="16" y="12" width="1168" height="318" rx="16" class="lane"/>
+<text x="30" y="38" text-anchor="start" class="lt">PROGRAM 1 · THE MONITOR</text>
+<text x="30" y="53" text-anchor="start" class="ls">always on · runs on a free cloud server</text>
+<rect x="250" y="20" width="130" height="28" rx="14.0" class="site"/>
+<text x="315.0" y="38.0" text-anchor="middle" class="pt">Visa website</text>
+<path d="M315,70 L315,50" class="ar" marker-end="url(#ah)"/>
+<rect x="40" y="70" width="150" height="80" rx="12" class="core"/>
+<text x="115.0" y="95" text-anchor="middle" class="nt">Timer (cron)</text>
+<text x="115.0" y="112" text-anchor="middle" class="ns">wakes up every 10 s</text>
+<circle cx="40" cy="70" r="11" class="numc"/>
+<text x="40" y="74" text-anchor="middle" class="numt">1</text>
+<rect x="240" y="70" width="150" height="80" rx="12" class="core"/>
+<text x="315.0" y="95" text-anchor="middle" class="nt">Check visa site</text>
+<text x="315.0" y="112" text-anchor="middle" class="ns">~1 s per check</text>
+<rect x="250" y="126" width="130" height="17" rx="8" class="logtag"/>
+<text x="315.0" y="138" text-anchor="middle" class="tg">log: monitor.log</text>
+<circle cx="240" cy="70" r="11" class="numc"/>
+<text x="240" y="74" text-anchor="middle" class="numt">2</text>
+<polygon points="450,110 535,60 620,110 535,160" class="core"/>
+<text x="535" y="106" text-anchor="middle" class="nt">D-visa</text>
+<text x="535" y="122" text-anchor="middle" class="nt">listed?</text>
+<circle cx="488" cy="76" r="11" class="numc"/>
+<text x="488" y="80" text-anchor="middle" class="numt">3</text>
+<rect x="680" y="70" width="150" height="80" rx="12" class="core"/>
+<text x="755.0" y="95" text-anchor="middle" class="nt">Alert people</text>
+<text x="755.0" y="112" text-anchor="middle" class="ns">Telegram + phone call</text>
+<rect x="690" y="126" width="130" height="17" rx="8" class="logtag"/>
+<text x="755.0" y="138" text-anchor="middle" class="tg">log: alerts_history.log</text>
+<circle cx="680" cy="70" r="11" class="numc"/>
+<text x="680" y="74" text-anchor="middle" class="numt">4</text>
+<rect x="900" y="70" width="150" height="80" rx="12" class="core"/>
+<text x="975.0" y="95" text-anchor="middle" class="nt">Leave trigger note</text>
+<text x="975.0" y="112" text-anchor="middle" class="ns">small file on the server</text>
+<circle cx="900" cy="70" r="11" class="numc"/>
+<text x="900" y="74" text-anchor="middle" class="numt">5</text>
+<path d="M190,110 L240,110" class="ar" marker-end="url(#ah)"/>
+<path d="M390,110 L450,110" class="ar" marker-end="url(#ah)"/>
+<path d="M620,110 L680,110" class="ar" marker-end="url(#ah)"/>
+<text x="650" y="102" text-anchor="middle" class="ls">yes</text>
+<path d="M830,110 L900,110" class="ar" marker-end="url(#ah)"/>
+<rect x="240" y="215" width="190" height="72" rx="12" class="fail"/>
+<text x="335.0" y="240" text-anchor="middle" class="nt">Check itself fails</text>
+<text x="335.0" y="257" text-anchor="middle" class="ns">layout change · timeout · SSL</text>
+<rect x="406" y="205" width="40" height="20" rx="10" class="msgc"/>
+<text x="426" y="219" text-anchor="middle" class="msgt">2</text>
+<path d="M315,150 L315,215" class="arf" marker-end="url(#ahr)"/>
+<rect x="455" y="222" width="160" height="48" rx="12" class="quiet"/>
+<text x="535" y="243" text-anchor="middle" class="nt">No → stay silent</text>
+<text x="535" y="260" text-anchor="middle" class="ns">only a log line is written</text>
+<path d="M535,160 L535,222" class="ar" marker-end="url(#ah)"/>
+<text x="548" y="196" text-anchor="start" class="ls">no</text>
+<rect x="660" y="225" width="115" height="40" rx="20.0" class="tgp"/>
+<text x="717.5" y="249.0" text-anchor="middle" class="pt">Telegram</text>
+<rect x="750" y="215" width="40" height="20" rx="10" class="msgc"/>
+<text x="770" y="229" text-anchor="middle" class="msgt">1</text>
+<rect x="790" y="225" width="115" height="40" rx="20.0" class="twp"/>
+<text x="847.5" y="249.0" text-anchor="middle" class="pt">Twilio call</text>
+<path d="M730,150 L717,225" class="ar" marker-end="url(#ah)"/>
+<path d="M780,150 L847,225" class="ar" marker-end="url(#ah)"/>
+<text x="847" y="284" text-anchor="middle" class="ns">max 3 calls, then 6 h pause</text>
+<rect x="915" y="228" width="120" height="20" rx="10" class="testtag"/>
+<text x="975" y="242" text-anchor="middle" class="tg">test: TEST_TELEGRAM</text>
+<path d="M975,150 L975,475" class="soft" marker-end="url(#ahs)"/>
+<text x="988" y="290" text-anchor="start" class="softt">SOFT LINK</text>
+<text x="988" y="305" text-anchor="start" class="ns">trigger note wakes</text>
+<text x="988" y="319" text-anchor="start" class="ns">Program 2</text>
+<rect x="16" y="345" width="1168" height="360" rx="16" class="lane"/>
+<text x="30" y="368" text-anchor="start" class="lt">PROGRAM 2 · THE BOOKER DAEMON</text>
+<text x="30" y="383" text-anchor="start" class="ls">optional · runs 24/7 · restarts itself · talks to the visa site directly (max 1 request/s)</text>
+<rect x="30" y="398" width="160" height="34" rx="17.0" class="cap"/>
+<text x="110.0" y="419.0" text-anchor="middle" class="pt">CapSolver</text>
+<text x="110" y="448" text-anchor="middle" class="ns">paid · ~$0.001 / solve</text>
+<rect x="260" y="392" width="570" height="48" rx="12" class="cap2"/>
+<text x="545" y="413" text-anchor="middle" class="nt">Token reserve: always 2 pre-solved CAPTCHAs in hand</text>
+<text x="545" y="430" text-anchor="middle" class="ns">replaced at 75 s old · spend capped at 250 solves per hour</text>
+<path d="M190,415 L260,415" class="ar" marker-end="url(#ah)"/>
+<path d="M755,440 L755,475" class="ar" marker-end="url(#ah)"/>
+<path d="M315,440 L315,475" class="ar" marker-end="url(#ah)"/>
+<rect x="900" y="475" width="150" height="80" rx="12" class="core"/>
+<text x="975.0" y="500" text-anchor="middle" class="nt">Watch for trigger</text>
+<text x="975.0" y="517" text-anchor="middle" class="ns">checks every 0.5 s</text>
+<rect x="910" y="531" width="130" height="17" rx="8" class="logtag"/>
+<text x="975.0" y="543" text-anchor="middle" class="tg">log: daemon.log</text>
+<circle cx="900" cy="475" r="11" class="numc"/>
+<text x="900" y="479" text-anchor="middle" class="numt">6</text>
+<rect x="680" y="475" width="150" height="80" rx="12" class="core"/>
+<text x="755.0" y="500" text-anchor="middle" class="nt">Get a parked seat</text>
+<text x="755.0" y="517" text-anchor="middle" class="ns">~2 s (20 s if cold)</text>
+<rect x="690" y="531" width="130" height="17" rx="8" class="logtag"/>
+<text x="755.0" y="543" text-anchor="middle" class="tg">log: daemon.log</text>
+<circle cx="680" cy="475" r="11" class="numc"/>
+<text x="680" y="479" text-anchor="middle" class="numt">7</text>
+<rect x="806" y="465" width="40" height="20" rx="10" class="msgc"/>
+<text x="826" y="479" text-anchor="middle" class="msgt">4</text>
+<rect x="460" y="475" width="150" height="80" rx="12" class="core"/>
+<text x="535.0" y="500" text-anchor="middle" class="nt">Poll for free times</text>
+<text x="535.0" y="517" text-anchor="middle" class="ns">every 2 s · 0.2–0.6 s each</text>
+<rect x="470" y="531" width="130" height="17" rx="8" class="logtag"/>
+<text x="535.0" y="543" text-anchor="middle" class="tg">log: daemon_polls.csv</text>
+<circle cx="460" cy="475" r="11" class="numc"/>
+<text x="460" y="479" text-anchor="middle" class="numt">8</text>
+<rect x="586" y="465" width="40" height="20" rx="10" class="msgc"/>
+<text x="606" y="479" text-anchor="middle" class="msgt">5</text>
+<rect x="240" y="475" width="150" height="80" rx="12" class="core"/>
+<text x="315.0" y="500" text-anchor="middle" class="nt">Pick slot &amp; submit</text>
+<text x="315.0" y="517" text-anchor="middle" class="ns">~1 s</text>
+<rect x="250" y="531" width="130" height="17" rx="8" class="testtag"/>
+<text x="315.0" y="543" text-anchor="middle" class="tg">test: dry-run stops here</text>
+<circle cx="240" cy="475" r="11" class="numc"/>
+<text x="240" y="479" text-anchor="middle" class="numt">9</text>
+<rect x="40" y="475" width="150" height="80" rx="12" class="core"/>
+<text x="115.0" y="500" text-anchor="middle" class="nt">Confirm &amp; record</text>
+<text x="115.0" y="517" text-anchor="middle" class="ns">“booked” flag saved</text>
+<rect x="50" y="531" width="130" height="17" rx="8" class="logtag"/>
+<text x="115.0" y="543" text-anchor="middle" class="tg">log: daemon.log</text>
+<circle cx="40" cy="475" r="11" class="numc"/>
+<text x="40" y="479" text-anchor="middle" class="numt">10</text>
+<rect x="166" y="465" width="40" height="20" rx="10" class="msgc"/>
+<text x="186" y="479" text-anchor="middle" class="msgt">6</text>
+<path d="M900,515 L830,515" class="ar" marker-end="url(#ah)"/>
+<path d="M680,515 L610,515" class="ar" marker-end="url(#ah)"/>
+<path d="M460,515 L390,515" class="ar" marker-end="url(#ah)"/>
+<path d="M240,515 L190,515" class="ar" marker-end="url(#ah)"/>
+<rect x="20" y="610" width="190" height="75" rx="12" class="fail"/>
+<text x="115.0" y="635" text-anchor="middle" class="nt">Submitted, can’t confirm</text>
+<text x="115.0" y="652" text-anchor="middle" class="ns">check the portal by hand</text>
+<rect x="186" y="600" width="40" height="20" rx="10" class="msgc"/>
+<text x="206" y="614" text-anchor="middle" class="msgt">8</text>
+<path d="M115,555 L115,610" class="arf" marker-end="url(#ahr)"/>
+<rect x="225" y="610" width="190" height="75" rx="12" class="fail"/>
+<text x="320.0" y="635" text-anchor="middle" class="nt">CAPTCHA not solved</text>
+<text x="320.0" y="652" text-anchor="middle" class="ns">slot found but not booked</text>
+<rect x="391" y="600" width="40" height="20" rx="10" class="msgc"/>
+<text x="411" y="614" text-anchor="middle" class="msgt">7</text>
+<path d="M320,555 L320,610" class="arf" marker-end="url(#ahr)"/>
+<rect x="440" y="610" width="190" height="75" rx="12" class="fail"/>
+<text x="535.0" y="635" text-anchor="middle" class="nt">Seat looks stale</text>
+<text x="535.0" y="652" text-anchor="middle" class="ns">0 slots though monitor says open</text>
+<rect x="606" y="600" width="40" height="20" rx="10" class="msgc"/>
+<text x="626" y="614" text-anchor="middle" class="msgt">9</text>
+<path d="M535,555 L535,610" class="arf" marker-end="url(#ahr)"/>
+<rect x="660" y="610" width="190" height="75" rx="12" class="fail"/>
+<text x="755.0" y="635" text-anchor="middle" class="nt">Solver trouble</text>
+<text x="755.0" y="652" text-anchor="middle" class="ns">balance &lt; $1 or 250/h cap hit</text>
+<rect x="826" y="600" width="40" height="20" rx="10" class="msgc"/>
+<text x="846" y="614" text-anchor="middle" class="msgt">10</text>
+<path d="M755,555 L755,610" class="arf" marker-end="url(#ahr)"/>
+<rect x="880" y="610" width="190" height="75" rx="12" class="fail"/>
+<text x="975.0" y="635" text-anchor="middle" class="nt">Daemon stops / crashes</text>
+<text x="975.0" y="652" text-anchor="middle" class="ns">systemd restarts it in 10 s</text>
+<rect x="1046" y="600" width="40" height="20" rx="10" class="msgc"/>
+<text x="1066" y="614" text-anchor="middle" class="msgt">3</text>
+<path d="M975,555 L975,610" class="arf" marker-end="url(#ahr)"/>
+<text x="1170" y="368" text-anchor="end" class="failt">Dashed red boxes = failure paths, each with its own alert</text>
+<rect x="16" y="720" width="1168" height="200" rx="16" class="lane"/>
+<text x="30" y="742" text-anchor="start" class="lt">WATCHING &amp; TESTING</text>
+<text x="30" y="762" text-anchor="start" class="ls">LOGS · where to look when something seems off</text>
+<rect x="30" y="772" width="195" height="58" rx="10" class="logbox"/>
+<text x="40" y="790" text-anchor="start" class="nt">monitor.log</text>
+<text x="40" y="805" text-anchor="start" class="ns">Every 10 s check result:</text>
+<text x="40" y="818" text-anchor="start" class="ns">NOT available · AVAILABLE · FAILURE</text>
+<rect x="235" y="772" width="195" height="58" rx="10" class="logbox"/>
+<text x="245" y="790" text-anchor="start" class="nt">alerts_history.log</text>
+<text x="245" y="805" text-anchor="start" class="ns">Permanent. Only real slots</text>
+<text x="245" y="818" text-anchor="start" class="ns">and real failures. Never clear.</text>
+<rect x="440" y="772" width="195" height="58" rx="10" class="logbox"/>
+<text x="450" y="790" text-anchor="start" class="nt">daemon.log</text>
+<text x="450" y="805" text-anchor="start" class="ns">Booker steps, timed in seconds</text>
+<text x="450" y="818" text-anchor="start" class="ns">since the trigger (seat, poll, submit)</text>
+<rect x="30" y="838" width="195" height="58" rx="10" class="logbox"/>
+<text x="40" y="856" text-anchor="start" class="nt">daemon_polls.csv</text>
+<text x="40" y="871" text-anchor="start" class="ns">One row per poll: session age,</text>
+<text x="40" y="884" text-anchor="start" class="ns">slots seen, query time (ms)</text>
+<rect x="235" y="838" width="195" height="58" rx="10" class="logbox"/>
+<text x="245" y="856" text-anchor="start" class="nt">daemon_dumps/</text>
+<text x="245" y="871" text-anchor="start" class="ns">Saved page of any failed</text>
+<text x="245" y="884" text-anchor="start" class="ns">booking, for later diagnosis</text>
+<rect x="440" y="838" width="195" height="58" rx="10" class="logbox"/>
+<text x="450" y="856" text-anchor="start" class="nt">journalctl</text>
+<text x="450" y="871" text-anchor="start" class="ns">Live view of the daemon:</text>
+<text x="450" y="884" text-anchor="start" class="ns">journalctl -u …-daemon -f</text>
+<text x="680" y="762" text-anchor="start" class="ls">TEST &amp; DUMMY SCENARIOS · safe ways to try it</text>
+<rect x="680" y="772" width="490" height="40" rx="10" class="testbox"/>
+<text x="692" y="789" text-anchor="start" class="nt">TEST_TELEGRAM=true</text>
+<text x="692" y="804" text-anchor="start" class="ns">Sends test ✉ 11 and a test call. Never touches the visa site.</text>
+<rect x="680" y="818" width="490" height="40" rx="10" class="testbox"/>
+<text x="692" y="835" text-anchor="start" class="nt">DAEMON_DRY_RUN=1</text>
+<text x="692" y="850" text-anchor="start" class="ns">Runs all of Program 2 as dummy “John Doe”, real CAPTCHA, stops before submit.</text>
+<rect x="680" y="864" width="490" height="40" rx="10" class="testbox"/>
+<text x="692" y="881" text-anchor="start" class="nt">test_daemon_units.py</text>
+<text x="692" y="896" text-anchor="start" class="ns">Offline checks: slot choice, rate limiter, dead-session detection.</text>
+</svg></div>
+
+<h2>Every message the system sends</h2>
+<div class="mtable"><table><tr><th>Badge</th><th>When</th><th>What it says (shortened)</th></tr><tr class="go"><td><span class="mc">1</span></td><td>Slot window opens</td><td>“✅ Long-stay visa (D-visa) application is now available for … Embassy … Book here: link”. Call says: “Estonia visa slot is now available. Check Telegram and book immediately.”</td></tr><tr class="bad"><td><span class="mc">2</span></td><td>Monitor’s own check fails</td><td>“⚠️ Estonia visa monitor is FAILING and cannot currently check the booking calendar. Error: …” Sent once, then silent for 1.5 h. Never rings the phone.</td></tr><tr class="bad"><td><span class="mc">3</span></td><td>Daemon starts or stops</td><td>“🚀 booker daemon started” · “🛑 booker daemon stopped”</td></tr><tr class="go"><td><span class="mc">4</span></td><td>Parked seat obtained</td><td>“🎫 Seat acquired … dates on the calendar … now parked, polling every 2 s”</td></tr><tr class="go"><td><span class="mc">5</span></td><td>Free times seen</td><td>“🕒 Slots visible at … on date” plus the times. Sent on change, at most every 30 s.</td></tr><tr class="go"><td><span class="mc">6</span></td><td>Booking confirmed</td><td>“✅ APPOINTMENT BOOKED” with embassy, date, applicant and reference (or “BOOKED AN EARLIER APPOINTMENT”).</td></tr><tr class="bad"><td><span class="mc">7</span></td><td>CAPTCHA can’t be solved</td><td>“❌ Slot found … but the booking CAPTCHA could not be solved. Check the portal manually.”</td></tr><tr class="bad"><td><span class="mc">8</span></td><td>Submitted, no confirmation</td><td>“⚠️ Submitted a booking … could not confirm success. CHECK THE PORTAL MANUALLY.”</td></tr><tr class="bad"><td><span class="mc">9</span></td><td>Parked seat looks stale</td><td>“⚠️ monitor reported D-visa available Ns ago, but the parked seat returned zero slots … starting reacquisition”</td></tr><tr class="bad"><td><span class="mc">10</span></td><td>Solver balance or limit</td><td>“⚠️ CapSolver balance is $x (below $1) …” (repeats hourly) · “⚠️ … hit its CAPTCHA rate limit … solving paused”</td></tr><tr class="test"><td><span class="mc">11</span></td><td>Test runs</td><td>“🧪 Test message from the … monitor” · “🧪 DRY RUN: would have booked … No real submit was made.”</td></tr></table></div>
+<p class="note">All messages go via Telegram (slot alert also places a call) and end with a “Sent from GCP” signature (configurable) so you know which machine sent them. Red-edged rows are warnings you should act on; Program 1 failures never trigger phone calls.</p>
+</div></body></html>
